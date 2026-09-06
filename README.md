@@ -83,6 +83,7 @@ plus shell syntax checks. GitHub Actions runs the same checks. Kernel
 compilation and real EC behavior need a compatible Spark.
 
 - [Firmware protocol](docs/protocol.md)
+- [Firmware pending-state investigation](docs/firmware-pending-analysis.md)
 - [Validation record](docs/validation.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)

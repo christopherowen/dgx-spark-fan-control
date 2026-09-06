@@ -38,6 +38,11 @@ output length, and any input bytes. Poll uses command byte `0x02`. The secure
 relay maps this to EC packet family 7. Poll responses begin with a state byte:
 0 complete, 1 EC error, 2 pending; output follows at byte 1.
 
+In SoC 2.155.11, that poll reads a **cached secure-partition flag and response**.
+It does not read the physical EC mailbox. Offline replay found completion
+ordering and stale-response defects; see the
+[firmware analysis and recovery assessment](firmware-pending-analysis.md).
+
 The driver serializes its transactions with a mutex, checks for pending work
 before submission, and polls at most 100 times with 10 ms between pending reads
 in each preflight and completion phase. Preflight drains a delayed completion;

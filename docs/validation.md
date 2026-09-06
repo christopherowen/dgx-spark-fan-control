@@ -109,6 +109,12 @@ soak remain outstanding.
 
 ## Known limitations
 
+The subsequent [firmware investigation](firmware-pending-analysis.md) reproduced
+eight scenarios by executing original SoC 2.155.11 instructions against a
+simulated EC boundary. It demonstrates an early-completion ordering defect and
+a conditional idle-mailbox recovery path. It does not establish the live trigger
+or validate recovery on either Spark.
+
 - This is an out-of-tree kernel module tied to the observed platform and APIs.
   DKMS can rebuild it for new kernels, but there is no promise of compatibility
   with a changed kernel or firmware contract.
@@ -120,7 +126,8 @@ soak remain outstanding.
   investigation. Use only one policy writer.
 - A permanently pending firmware transaction cannot be recovered by these
   ownership fixes. No safe software reset of that relay has been established;
-  the underlying firmware trigger remains unknown. Version 0.1.1 handles the
+  the live trigger remains unconfirmed. A firmware ordering defect and conditional
+  recovery were reproduced offline, as described above. Version 0.1.1 handles the
   failure with bounded retries and an explicit failed service.
 - The daemon ignores individual unreadable or implausible thermal sensors.
   Maximum cooling is requested only when no valid sensor readings remain.

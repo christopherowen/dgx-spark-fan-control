@@ -54,7 +54,10 @@ A separate failure was observed on two systems running version 0.1.0: the stock
 ACPI EC time read still worked, while successful FF-A poll calls continuously
 returned packet state `2` (pending). No new fan request was being submitted.
 This differs from a failed FF-A call or submission status `0x0a` (mailbox busy).
-The firmware cause of the outstanding request failing to complete is unknown.
+The live trigger remains unconfirmed. Further offline analysis reproduced a
+firmware ordering defect that can leave the pending flag set **after the EC
+has completed the request**. See the [firmware analysis](firmware-pending-analysis.md)
+for that distinction, other failure paths, and a conditional recovery candidate.
 
 Version 0.1.1 logs preflight timeouts separately from submission failures. The
 daemon retries transient transport errors after two and four seconds; after
@@ -67,9 +70,11 @@ Systemd does not restart exit 69. Unexpected process crashes have a 30-second
 restart delay and a three-start limit per five minutes. SIGTERM lets the daemon
 perform its own cleanup, without a competing `ExecStop` writer.
 
-Retain the kernel and service logs. Arrange a maintenance shutdown and cold
-power cycle if the relay remains pending; recovery of this particular pending
-condition has not yet been validated. Do not unload/reload to discard ownership
+Retain the kernel and service logs. A maintenance shutdown and cold power cycle
+remains a recovery candidate; recovery of this particular pending condition has
+not yet been validated. Offline replay also identified a possible recovery
+without rebooting when the physical mailbox is idle; this requires a bounded
+diagnostic and has not been attempted on hardware. Do not unload/reload to discard ownership
 state, remove the pending check, or submit raw reset packets. After firmware
 communication is restored and status verifies state 0, restart explicitly:
 
