@@ -53,10 +53,32 @@ This check used a temporary build directory and did not sign, install, or load
 the module, or modify the running controller. The public signing wrapper has
 not been exercised end to end with an enrolled key.
 
+## Installation-guide and DKMS checks
+
+On **2026-09-06**, the added `dkms.conf` passed an isolated **DKMS 3.0.11
+add/build** on a Spark with `6.17.0-1029-nvidia`. DKMS reported the module as
+`built`; `modinfo` confirmed version 0.1.0, the target aarch64 vermagic, and
+the test certificate's signing identity. This used an upstream DKMS script,
+temporary source/state directories, and a disposable signing key. The test
+did not register with the host's system DKMS tree, enroll a key, install or
+load a module, or change the running controller. Temporary files were removed.
+
+All 13 existing tests and shell syntax checks passed. Documentation links and
+anchors were checked, and all 38 documented shell blocks passed `bash -n`.
+The Bash job example was exercised with mock commands for job success, job
+failure, and restoration failure; it attempted automatic restoration and
+returned the expected exit status in each case. This does not verify real
+signal delivery, sudo renewal, or EC recovery on hardware.
+
+System-wide DKMS installation, distribution kernel-update hooks, and preboot
+enrollment remain operator steps described in the guide, not actions performed
+by these checks.
+
 ## Known limitations
 
 - This is an out-of-tree kernel module tied to the observed platform and APIs.
-  There is no DKMS integration or promise of firmware-forward compatibility.
+  DKMS can rebuild it for new kernels, but there is no promise of compatibility
+  with a changed kernel or firmware contract.
 - Manual floors do not expire. SIGKILL, a kernel crash, or a broken transport
   can prevent restoration. A retained lower floor can leave the fans running
   faster; it does not suppress firmware cooling demand.
