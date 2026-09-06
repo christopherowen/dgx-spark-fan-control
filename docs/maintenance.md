@@ -19,7 +19,7 @@ Before rebooting into a new kernel, set its **exact installed release name**
 # Replace the example with the kernel you are about to boot.
 new_kernel="6.17.0-1029-nvidia"
 sudo apt-get install "linux-headers-$new_kernel"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.0 -k "$new_kernel"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.1 -k "$new_kernel"
 dkms status -m dgx-spark-fan-control
 modinfo -k "$new_kernel" -F vermagic dgx_ec_fan_control
 modinfo -k "$new_kernel" -F signer dgx_ec_fan_control
@@ -68,7 +68,9 @@ After reboot, perform the status checks above.
 ## Update this project's source
 
 Do this between jobs. First restore automatic control and unload the existing
-module; do not proceed if restoration or readback fails:
+module; do not proceed if restoration or readback fails. A persistently pending
+relay needs [maintenance recovery](troubleshooting.md#persistent-pending-and-service-exit-69)
+before the new module can be loaded safely:
 
 ```sh
 sudo systemctl stop dgx-fan-control.service
@@ -84,9 +86,11 @@ Then follow the route you originally installed:
 - **Manual:** repeat the manual build/sign/install commands for the running
   kernel. Also rebuild for other installed kernels you intend to boot.
 - **DKMS:** remove the old registered version with
-  `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`, then repeat the
-  source-copy, add, build, and install steps in the installation guide. Use the
-  version in the new checkout's `dkms.conf` (currently `0.1.0`) wherever the
+  `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`
+  when upgrading from 0.1.0 (check `dkms status` for your installed version),
+  then repeat the source-copy, add, build, and install steps in the installation
+  guide. Use the
+  version in the new checkout's `dkms.conf` (currently `0.1.1`) wherever the
   commands name a version. This also refreshes a changed checkout that retains
   the same version; `git pull` alone does not refresh DKMS's stored source.
   Build for every additional installed kernel you intend to boot.
@@ -140,7 +144,7 @@ inspect and restore a failed state.
 For DKMS (substitute your installed version if different):
 
 ```sh
-sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all
+sudo dkms remove -m dgx-spark-fan-control -v 0.1.1 --all
 dkms status -m dgx-spark-fan-control
 ```
 
@@ -152,7 +156,7 @@ sudo depmod -a
 ```
 
 Repeat manual removal for other kernels where you installed it. DKMS source
-under `/usr/src/dgx-spark-fan-control-0.1.0` can be removed separately once no
+under `/usr/src/dgx-spark-fan-control-0.1.1` can be removed separately once no
 registered version uses it.
 
 ### 3. Remove startup entries and the userland command

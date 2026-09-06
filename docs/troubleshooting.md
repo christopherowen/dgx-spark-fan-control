@@ -41,10 +41,47 @@ maintenance shutdown and cold power cycle. Do not repeatedly load competing
 probes or access controller MMIO: even a normal-world read of the secure-owned
 eSPI controller caused a watchdog reboot during the original investigation.
 
-An ownership mismatch also causes failure: the driver will not overwrite an
-unknown existing floor. Avoid concurrent writers. A floor written successfully
-but followed by failed readback can leave the driver unable to authenticate
-ownership; see the [known limitations](validation.md#known-limitations).
+An ownership mismatch (`ESTALE` in version 0.1.1) also causes failure: the driver
+will not overwrite an unknown existing floor. Avoid concurrent writers. Version
+0.1.1 remembers its own attempted write and can reconcile it after transport
+recovery, even when acknowledgement or readback failed. Version 0.1.0 could lose
+ownership in this situation. Neither version can restore through a relay that
+never completes its outstanding transaction.
+
+## Persistent pending and service exit 69
+
+A separate failure was observed on two systems running version 0.1.0: the stock
+ACPI EC time read still worked, while successful FF-A poll calls continuously
+returned packet state `2` (pending). No new fan request was being submitted.
+This differs from a failed FF-A call or submission status `0x0a` (mailbox busy).
+The firmware cause of the outstanding request failing to complete is unknown.
+
+Version 0.1.1 logs preflight timeouts separately from submission failures. The
+daemon retries transient transport errors after two and four seconds; after
+three consecutive failures it attempts automatic restoration and exits 69.
+Non-retryable errors, including an ownership mismatch, stop immediately. Both
+the initiating error and any restoration failure remain in the journal. A
+failed restoration means the current floor is **unverified**, not automatic.
+
+Systemd does not restart exit 69. Unexpected process crashes have a 30-second
+restart delay and a three-start limit per five minutes. SIGTERM lets the daemon
+perform its own cleanup, without a competing `ExecStop` writer.
+
+Retain the kernel and service logs. Arrange a maintenance shutdown and cold
+power cycle if the relay remains pending; recovery of this particular pending
+condition has not yet been validated. Do not unload/reload to discard ownership
+state, remove the pending check, or submit raw reset packets. After firmware
+communication is restored and status verifies state 0, restart explicitly:
+
+```sh
+dgx-fan-control status                    # require state=0/12
+sudo systemctl reset-failed dgx-fan-control.service
+sudo systemctl start dgx-fan-control.service
+sudo journalctl -u dgx-fan-control.service -n 30
+```
+
+A successful restart must be followed by state, RPM, and temperature checks
+under load, automatic restoration, and a longer soak before claiming stability.
 
 ## Fans stay fast, or curve stops following temperature
 
@@ -53,13 +90,9 @@ fans fast until its own policy decides to reduce them. Check RPM and temperature
 over time. The daemon's sensor-failure response requests maximum cooling; its
 journal explains those transitions.
 
-Stop the daemon before using `set-state`. After suspend/resume, restart the
-daemon to synchronize its cached state with the kernel's restored state:
-
-```sh
-sudo systemctl restart dgx-fan-control.service
-dgx-fan-control status
-```
+Stop the daemon before using `set-state`. Version 0.1.1 rereads the kernel state
+on every sample, so normal suspend/resume needs no manual restart. Version
+0.1.0 needs `sudo systemctl restart dgx-fan-control.service` after resume.
 
 For an issue report, include board model, OS/kernel and firmware versions,
 module version, the commands used, and relevant log excerpts. Remove hostnames,

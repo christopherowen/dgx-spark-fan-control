@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import math
 import signal
 import sys
-import time
+from threading import Event
 from pathlib import Path
 
 COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
@@ -18,6 +19,13 @@ FILTER_ALPHA = 0.35
 DOWN_HYSTERESIS_C = 4.0
 UP_STATES_PER_POLL = 2
 DOWN_STATES_PER_POLL = 1
+TRANSPORT_FAILURE_LIMIT = 3
+RETRY_INITIAL_SECONDS = 2.0
+CONTROLLER_UNAVAILABLE_EXIT = 69
+RETRYABLE_ERRNOS = frozenset((
+    errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
+    errno.ETIMEDOUT, errno.EREMOTEIO,
+))
 
 # The curve becomes deliberately aggressive well below NVIDIA's stock 80 C
 # second step. Firmware still takes the maximum of its own demand and this
@@ -110,51 +118,83 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
     cooling_device = find_cooling_device(thermal_root)
-    current = read_state(cooling_device)
     filtered_temperature_c: float | None = None
-    stop_requested = False
+    stop_requested = Event()
+    failures = 0
+    primary_failure = False
 
     def request_stop(signum: int, frame: object) -> None:
-        nonlocal stop_requested
-        stop_requested = True
+        stop_requested.set()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    LOG.info("controller started at cooling state %d", current)
+    LOG.info("controller starting; authenticating the current cooling state")
 
     try:
-        while not stop_requested:
+        while not stop_requested.is_set():
             try:
-                hottest = read_hottest_temperature_c(thermal_root)
-                if filtered_temperature_c is None:
-                    filtered_temperature_c = hottest
-                else:
-                    filtered_temperature_c += FILTER_ALPHA * (
-                        hottest - filtered_temperature_c
-                    )
-                desired = next_state(current, filtered_temperature_c)
-            except Exception:
-                LOG.exception("temperature observation failed; requesting maximum cooling")
-                hottest = math.nan
-                filtered_temperature_c = None
-                desired = MAX_STATE
+                # Suspend, an EC reset, or an uncertain write may change state.
+                # Read it on every pass before deciding that no update is needed.
+                current = read_state(cooling_device)
+                try:
+                    hottest = read_hottest_temperature_c(thermal_root)
+                    if filtered_temperature_c is None:
+                        filtered_temperature_c = hottest
+                    else:
+                        filtered_temperature_c += FILTER_ALPHA * (
+                            hottest - filtered_temperature_c
+                        )
+                    desired = next_state(current, filtered_temperature_c)
+                except (OSError, RuntimeError, ValueError):
+                    LOG.exception("temperature observation failed; requesting maximum cooling")
+                    hottest = math.nan
+                    filtered_temperature_c = None
+                    desired = MAX_STATE
 
-            if desired != current:
-                write_state(cooling_device, desired)
-                LOG.info(
-                    "cooling state %d -> %d (hottest=%.1fC filtered=%s)",
-                    current,
-                    desired,
-                    hottest,
-                    "unavailable"
-                    if filtered_temperature_c is None
-                    else f"{filtered_temperature_c:.1f}C",
+                if desired != current:
+                    write_state(cooling_device, desired)
+                    LOG.info(
+                        "cooling state %d -> %d (hottest=%.1fC filtered=%s)",
+                        current,
+                        desired,
+                        hottest,
+                        "unavailable"
+                        if filtered_temperature_c is None
+                        else f"{filtered_temperature_c:.1f}C",
+                    )
+                if failures:
+                    LOG.info("fan communication recovered after %d failed attempts", failures)
+                failures = 0
+            except OSError as exc:
+                failures += 1
+                filtered_temperature_c = None
+                if exc.errno not in RETRYABLE_ERRNOS or failures >= TRANSPORT_FAILURE_LIMIT:
+                    LOG.error(
+                        "fan control unavailable after %d failed attempt(s): %s; "
+                        "stopping for operator recovery, current floor is unverified",
+                        failures, exc,
+                    )
+                    raise
+                delay = RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
+                LOG.warning(
+                    "fan communication failed (%d/%d): %s; retrying in %.1fs",
+                    failures, TRANSPORT_FAILURE_LIMIT, exc, delay,
                 )
-                current = desired
-            time.sleep(poll_seconds)
+                stop_requested.wait(delay)
+                continue
+            stop_requested.wait(poll_seconds)
+    except BaseException:
+        primary_failure = True
+        raise
     finally:
-        write_state(cooling_device, 0)
-        LOG.info("automatic NVIDIA fan policy restored")
+        try:
+            write_state(cooling_device, 0)
+        except Exception:
+            LOG.exception("automatic restoration failed; current fan floor is unverified")
+            if not primary_failure:
+                raise
+        else:
+            LOG.info("automatic NVIDIA fan policy restored")
     return 0
 
 
@@ -197,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     except (OSError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
-        return 1
+        return CONTROLLER_UNAVAILABLE_EXIT if args.command == "daemon" else 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 

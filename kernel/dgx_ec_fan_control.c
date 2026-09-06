@@ -53,7 +53,7 @@
 #define DGX_EC_LIMIT_UNSET		U16_MAX
 #define DGX_EC_MAX_PLAUSIBLE_RPM	30000U
 #define DGX_EC_RESTORE_RETRY_MS		100U
-#define DGX_EC_RESTORE_ATTEMPTS		30U
+#define DGX_EC_RESTORE_ATTEMPTS		3U
 #define DGX_EC_SHARED_PARTITION_ID	0x8003U
 #define DGX_EC_SHARED_PARTITION_PROPS	0x0109U
 
@@ -95,6 +95,8 @@ struct dgx_ec_fan_control_data {
 	unsigned long last_updated;
 	unsigned long current_state;
 	u16 rpm[2];
+	u16 attempted_floor;
+	bool floor_uncertain;
 	bool telemetry_valid;
 };
 
@@ -151,33 +153,26 @@ static int dgx_ec_packet_poll(struct ffa_device *ffa_dev, u8 *state,
 	return 0;
 }
 
-static int dgx_ec_preflight(struct ffa_device *ffa_dev)
-{
-	u8 state;
-	int ret;
-
-	ret = dgx_ec_packet_poll(ffa_dev, &state, NULL, 0);
-	if (ret)
-		return ret;
-	if (state == DGX_EC_PACKET_PENDING)
-		return -EBUSY;
-	if (state != DGX_EC_PACKET_COMPLETE)
-		return -EREMOTEIO;
-
-	return 0;
-}
-
 static int dgx_ec_submit_status(struct ffa_device *ffa_dev,
 				struct ffa_send_direct_data2 *message)
 {
 	u8 *raw = (u8 *)message->data;
+	u8 operation = raw[1];
 	int ret;
 
 	ret = ffa_dev->ops->msg_ops->sync_send_receive2(ffa_dev, message);
-	if (ret)
+	if (ret) {
+		dev_warn_ratelimited(&ffa_dev->dev,
+			"FF-A submit operation=%#x failed: %d\n",
+			operation, ret);
 		return ret;
+	}
 
 	ret = get_unaligned_le32(raw);
+	if (ret)
+		dev_warn_ratelimited(&ffa_dev->dev,
+			"packet submit operation=%#x status=%#x\n",
+			operation, ret);
 	if (ret == DGX_EC_PACKET_SP_ESPI_READ_FAILED)
 		return -EIO;
 	if (ret == DGX_EC_PACKET_SP_MAILBOX_BUSY)
@@ -208,7 +203,23 @@ static int dgx_ec_wait_for_completion(struct ffa_device *ffa_dev,
 		msleep(DGX_EC_PACKET_POLL_DELAY_MS);
 	}
 
+	dev_warn_ratelimited(&ffa_dev->dev,
+		"packet poll timed out: state=%#x after %u polls\n",
+		state, DGX_EC_PACKET_POLL_ATTEMPTS);
 	return -ETIMEDOUT;
+}
+
+static int dgx_ec_preflight(struct ffa_device *ffa_dev, u8 operation)
+{
+	int ret;
+
+	/* Drain a late completion before another request can reuse the relay. */
+	ret = dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	if (ret)
+		dev_warn_ratelimited(&ffa_dev->dev,
+			"operation=%#x preflight failed: %d; no request submitted\n",
+			operation, ret);
+	return ret;
 }
 
 static int dgx_ec_read_operation(struct ffa_device *ffa_dev, u8 operation,
@@ -233,7 +244,7 @@ static int dgx_ec_read_operation(struct ffa_device *ffa_dev, u8 operation,
 		return -EPERM;
 	}
 
-	ret = dgx_ec_preflight(ffa_dev);
+	ret = dgx_ec_preflight(ffa_dev, operation);
 	if (ret)
 		return ret;
 
@@ -248,13 +259,15 @@ static int dgx_ec_read_operation(struct ffa_device *ffa_dev, u8 operation,
 	return dgx_ec_wait_for_completion(ffa_dev, output, output_length);
 }
 
-static int dgx_ec_write_lower_floor(struct ffa_device *ffa_dev, u16 value)
+static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
+				  u16 value)
 {
+	struct ffa_device *ffa_dev = data->ffa_dev;
 	struct ffa_send_direct_data2 message = { 0 };
 	u8 *raw = (u8 *)message.data;
 	int ret;
 
-	ret = dgx_ec_preflight(ffa_dev);
+	ret = dgx_ec_preflight(ffa_dev, DGX_EC_FAN_SET_LOWER_LIMIT);
 	if (ret)
 		return ret;
 
@@ -263,6 +276,9 @@ static int dgx_ec_write_lower_floor(struct ffa_device *ffa_dev, u16 value)
 	raw[2] = DGX_EC_FAN_LIMIT_LENGTH;
 	raw[3] = 0;
 	put_unaligned_le16(value, raw + 4);
+	/* A transport error does not prove that the EC rejected this write. */
+	data->attempted_floor = value;
+	data->floor_uncertain = true;
 	ret = dgx_ec_submit_status(ffa_dev, &message);
 	if (ret)
 		return ret;
@@ -346,6 +362,35 @@ static int dgx_ec_refresh(struct dgx_ec_fan_control_data *data)
 	return 0;
 }
 
+/* Called under lock, only after a complete, authenticated floor read. */
+static int dgx_ec_reconcile_floor(struct dgx_ec_fan_control_data *data, u16 floor)
+{
+	unsigned int state;
+
+	if (floor == DGX_EC_LIMIT_UNSET) {
+		data->current_state = 0;
+	} else if (floor == dgx_ec_floor_states[data->current_state]) {
+		/* A completed request left the last confirmed floor intact. */
+	} else if (data->floor_uncertain && floor == data->attempted_floor) {
+		for (state = 1; state < ARRAY_SIZE(dgx_ec_floor_states); state++) {
+			if (floor == dgx_ec_floor_states[state])
+				break;
+		}
+		if (state == ARRAY_SIZE(dgx_ec_floor_states))
+			return -ESTALE;
+		data->current_state = state;
+	} else {
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"floor ownership mismatch: observed=%#x confirmed=%#x\n",
+			floor, dgx_ec_floor_states[data->current_state]);
+		return -ESTALE;
+	}
+
+	data->floor_uncertain = false;
+	data->telemetry_valid = false;
+	return 0;
+}
+
 static int dgx_ec_restore_automatic_locked(struct dgx_ec_fan_control_data *data)
 {
 	u16 floor;
@@ -354,14 +399,11 @@ static int dgx_ec_restore_automatic_locked(struct dgx_ec_fan_control_data *data)
 	ret = dgx_ec_read_lower_floor(data, &floor);
 	if (ret)
 		return ret;
-	if (floor == DGX_EC_LIMIT_UNSET) {
-		data->current_state = 0;
-		return 0;
-	}
-	if (floor != dgx_ec_floor_states[data->current_state])
-		return -EBUSY;
+	ret = dgx_ec_reconcile_floor(data, floor);
+	if (ret || floor == DGX_EC_LIMIT_UNSET)
+		return ret;
 
-	ret = dgx_ec_write_lower_floor(data->ffa_dev, DGX_EC_LIMIT_UNSET);
+	ret = dgx_ec_write_lower_floor(data, DGX_EC_LIMIT_UNSET);
 	if (ret)
 		return ret;
 	ret = dgx_ec_read_lower_floor(data, &floor);
@@ -370,9 +412,7 @@ static int dgx_ec_restore_automatic_locked(struct dgx_ec_fan_control_data *data)
 	if (floor != DGX_EC_LIMIT_UNSET)
 		return -EIO;
 
-	data->current_state = 0;
-	data->telemetry_valid = false;
-	return 0;
+	return dgx_ec_reconcile_floor(data, floor);
 }
 
 static int dgx_ec_restore_automatic(struct dgx_ec_fan_control_data *data,
@@ -384,9 +424,10 @@ static int dgx_ec_restore_automatic(struct dgx_ec_fan_control_data *data,
 	mutex_lock(&data->lock);
 	for (attempt = 0; attempt < DGX_EC_RESTORE_ATTEMPTS; attempt++) {
 		ret = dgx_ec_restore_automatic_locked(data);
-		if (!ret)
+		if (!ret || ret == -ESTALE)
 			break;
-		msleep(DGX_EC_RESTORE_RETRY_MS);
+		if (attempt + 1 < DGX_EC_RESTORE_ATTEMPTS)
+			msleep(DGX_EC_RESTORE_RETRY_MS);
 	}
 	if (ret)
 		dev_emerg(&data->ffa_dev->dev,
@@ -455,8 +496,8 @@ static int dgx_ec_get_cur_state(struct thermal_cooling_device *cdev,
 	if (ret)
 		return ret;
 	ret = dgx_ec_read_lower_floor(data, &floor);
-	if (!ret && floor != dgx_ec_floor_states[data->current_state])
-		ret = -EIO;
+	if (!ret)
+		ret = dgx_ec_reconcile_floor(data, floor);
 	if (!ret)
 		*state = data->current_state;
 	mutex_unlock(&data->lock);
@@ -483,10 +524,9 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 	ret = dgx_ec_read_lower_floor(data, &current_floor);
 	if (ret)
 		goto unlock;
-	if (current_floor != dgx_ec_floor_states[data->current_state]) {
-		ret = -EBUSY;
+	ret = dgx_ec_reconcile_floor(data, current_floor);
+	if (ret)
 		goto unlock;
-	}
 	if (state == data->current_state)
 		goto unlock;
 	if (state == 0) {
@@ -495,7 +535,7 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 	}
 
 	target_floor = dgx_ec_floor_states[state];
-	ret = dgx_ec_write_lower_floor(data->ffa_dev, target_floor);
+	ret = dgx_ec_write_lower_floor(data, target_floor);
 	if (ret)
 		goto failed_write;
 	ret = dgx_ec_read_lower_floor(data, &current_floor);
@@ -506,8 +546,7 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 		goto failed_write;
 	}
 
-	data->current_state = state;
-	data->telemetry_valid = false;
+	ret = dgx_ec_reconcile_floor(data, current_floor);
 
 report:
 	if (!ret)
@@ -679,4 +718,4 @@ MODULE_SOFTDEP("pre: arm-ffa");
 MODULE_AUTHOR("Christopher Owen");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NVIDIA DGX Spark EC additive fan-floor cooling device");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.1.1");

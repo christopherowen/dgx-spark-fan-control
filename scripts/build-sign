@@ -22,8 +22,12 @@ if [[ "$(stat -c '%a' "$private_key")" != 600 ]]; then
   exit 1
 fi
 
-# mokutil's exit status is the contract; do not parse localized output.
-if ! mokutil --test-key "$certificate"; then
+# DGX OS's mokutil can return 1 even when it reports an enrolled certificate.
+# Require its exact affirmative line under a fixed locale; never accept an
+# exit status alone (other builds use 0 for an enrolled certificate).
+enrollment="$(LC_ALL=C mokutil --test-key "$certificate" 2>&1 || true)"
+if ! printf '%s\n' "$enrollment" | grep -Fxq -- "$certificate is already enrolled"; then
+  printf '%s\n' "$enrollment" >&2
   echo "enroll the signing certificate before building a load candidate" >&2
   exit 1
 fi

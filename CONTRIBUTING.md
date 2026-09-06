@@ -6,7 +6,9 @@ small, reviewable changes and describe how you checked them.
 
 Run `./scripts/check` before submitting. Policy/filesystem tests use temporary
 directories and mocks; they must never read or write the test host's real
-thermal sysfs. Driver changes also need a `W=1` build on the target kernel and
+thermal sysfs. Transaction tests compile the driver's actual C functions with
+simulated FF-A responses; they exercise failure recovery without contacting
+firmware. Driver changes also need a `W=1` build on the target kernel and
 an explicitly documented hardware validation result or testing limitation.
 
 Keep `PACKAGE_VERSION` in `dkms.conf` aligned with the driver's `MODULE_VERSION`

@@ -39,7 +39,10 @@ relay maps this to EC packet family 7. Poll responses begin with a state byte:
 0 complete, 1 EC error, 2 pending; output follows at byte 1.
 
 The driver serializes its transactions with a mutex, checks for pending work
-before submission, and polls at most 100 times with 10 ms between pending reads.
+before submission, and polls at most 100 times with 10 ms between pending reads
+in each preflight and completion phase. Preflight drains a delayed completion;
+a timeout refuses the new submission. It does not clear or overwrite a pending
+firmware transaction.
 It does not coordinate arbitrary third-party clients: only one driver/client
 should own this relay. FF-A call duration itself is not bounded by the poll loop.
 
@@ -74,10 +77,19 @@ additive guarantee is relative to the firmware policy and any existing upper
 clamp; it does not audit or repair changes made by other software.
 
 Probe requires an initially unset lower clamp. State changes authenticate the
-existing floor and read back the result. If another owner changes the floor,
-the driver refuses to overwrite it. Restoration uses the same ownership check
-and has up to 30 attempts on lifecycle paths. Failures are logged; restoration
-is not guaranteed after a broken transport, interrupted write, or hard crash.
+existing floor and read back the result. Before submitting a write, the driver
+records its attempted floor as uncertain. A later completed read may reconcile
+the last confirmed floor, that exact attempted floor, or an unset clamp. This
+allows recovery when a write was applied but its acknowledgement or readback
+failed. An unrelated value returns `ESTALE` and is never overwritten. A second
+writer using the same value cannot be distinguished, so exclusive relay
+ownership remains required.
+
+Restoration uses the same reconciliation and has up to three attempts on
+lifecycle paths, with 100 ms between attempts. An ownership mismatch stops
+those retries immediately. Failures are logged; restoration is not guaranteed
+after a broken transport or hard crash. The in-memory attempted value does not
+survive module removal or reboot; probe still requires an unset floor.
 There is no EC-side expiry timer for a manual floor.
 
 ## Related primary documentation

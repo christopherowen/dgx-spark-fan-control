@@ -66,14 +66,20 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
+Version 0.1.1 fixes lost-write ownership recovery and resume synchronization,
+and stops persistent communication failures from causing endless service
+restarts. A firmware relay stuck pending was observed on two systems running
+0.1.0; its trigger and recovery remain unqualified. See
+[recovery instructions](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 Orderly stop, suspend, reboot, and module removal request and verify automatic
 control. A hard crash or transport failure can prevent restoration; manual
 floors have no expiry timer. Read the [validation and limitations](docs/validation.md).
 
 ## Development
 
-Run `./scripts/check` for hardware-free policy, failure-path, and source-contract
-tests plus shell syntax checks. GitHub Actions runs the same checks. Kernel
+Run `./scripts/check` (Python 3.10+ and a C compiler) for hardware-free policy,
+failure-path, compiled C transaction, signing-wrapper, and source-contract tests
+plus shell syntax checks. GitHub Actions runs the same checks. Kernel
 compilation and real EC behavior need a compatible Spark.
 
 - [Firmware protocol](docs/protocol.md)

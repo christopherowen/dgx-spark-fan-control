@@ -142,8 +142,11 @@ one with 4°C hysteresis. If no valid kernel thermal-zone readings remain, it
 requests state 12 immediately. Individual invalid sensors are skipped.
 
 Constants live in [`userspace/dgx_fan_control.py`](../userspace/dgx_fan_control.py).
-After suspend/resume, restart the service to resynchronize its cached state:
-`sudo systemctl restart dgx-fan-control.service`.
+The daemon rereads the kernel state each sample, including after suspend/resume.
+Brief transport failures receive two retries, after two and four seconds. Three
+consecutive failures stop the service with exit status 69 and an attempted
+automatic restoration. Systemd leaves it failed for operator recovery instead
+of restarting indefinitely. See [troubleshooting](troubleshooting.md).
 
 ## Choose a fan floor
 

@@ -50,8 +50,8 @@ the compiler command-name difference (`gcc-13` versus
 `aarch64-linux-gnu-gcc-13`, both Ubuntu GCC 13.3.0) and skipped BTF generation
 because `vmlinux` was unavailable. There were no driver compilation errors.
 This check used a temporary build directory and did not sign, install, or load
-the module, or modify the running controller. The public signing wrapper has
-not been exercised end to end with an enrolled key.
+the module, or modify the running controller. The original extraction check did
+not exercise the signing wrapper; the 0.1.1 check below does.
 
 ## Installation-guide and DKMS checks
 
@@ -74,6 +74,39 @@ System-wide DKMS installation, distribution kernel-update hooks, and preboot
 enrollment remain operator steps described in the guide, not actions performed
 by these checks.
 
+## Version 0.1.1 recovery checks
+
+On **2026-09-06**, all **21 tests** and shell syntax checks passed. The suite now
+compiles the driver's actual C transaction functions against a simulated FF-A
+peer and exercises ten scenarios: lost write completion, lost readback,
+reconciliation after transport recovery, an unrelated floor, a foreign change
+during a write, lost automatic-restoration completion, delayed preflight
+completion, permanent pending, bounded restoration retries, and unexpected
+protocol/transport responses. This exercises the C behavior, not Linux locking,
+real timing, or secure firmware execution.
+
+Python checks cover transient and persistent failures, preserving the original
+error through failed cleanup, ownership rejection, resume resynchronization,
+signal interruption of retry waits, and the service's exit-69 contract. The
+signing wrapper accepts only mokutil's exact affirmative enrollment message,
+including the exit-status-1 convention observed on DGX OS; rejection cases are
+also tested with isolated mock commands.
+
+The 0.1.1 module built with `W=1` and was signed using an already-enrolled local
+certificate on **both Sparks** against `6.17.0-1029-nvidia`. Version, aarch64
+vermagic, and signature identity were verified. The only build notices were the
+same GCC command-name difference and missing `vmlinux` described above. These
+signed modules remain staged, **not installed or loaded**.
+
+The updated Python command and systemd unit were installed on both systems,
+with backups of the previous files. Against the existing stuck relay and loaded
+0.1.0 driver, each service made three attempts, reported failed automatic
+restoration, exited 69, and remained failed with zero restarts. This validates
+failure containment on hardware; it does **not** establish recovered fan control.
+The current floor could not be verified. No reboot or cold power cycle was
+performed, and the new kernel driver's successful live operation and long-term
+soak remain outstanding.
+
 ## Known limitations
 
 - This is an out-of-tree kernel module tied to the observed platform and APIs.
@@ -82,13 +115,13 @@ by these checks.
 - Manual floors do not expire. SIGKILL, a kernel crash, or a broken transport
   can prevent restoration. A retained lower floor can leave the fans running
   faster; it does not suppress firmware cooling demand.
-- Restoration refuses a floor that does not match the driver's last confirmed
-  state. A write that reaches the EC but loses its acknowledgement can therefore
-  leave an unconfirmed floor and require operator recovery.
-- The kernel resets its state on suspend. The daemon caches its last state and
-  does not resynchronize it on resume or after an external writer changes it.
-  Restart the service after resume; use only one policy writer. NVIDIA automatic
-  policy continues to operate while the added floor is unset.
+- Restoration accepts only the last confirmed floor, the driver's own uncertain
+  attempted floor, or an unset clamp. An unrelated value requires operator
+  investigation. Use only one policy writer.
+- A permanently pending firmware transaction cannot be recovered by these
+  ownership fixes. No safe software reset of that relay has been established;
+  the underlying firmware trigger remains unknown. Version 0.1.1 handles the
+  failure with bounded retries and an explicit failed service.
 - The daemon ignores individual unreadable or implausible thermal sensors.
   Maximum cooling is requested only when no valid sensor readings remain.
 - Fan RPM is not an exact setpoint. Firmware demand, fan saturation, and ramp

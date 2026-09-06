@@ -2,14 +2,16 @@
 Description=DGX Spark additive fan-floor controller
 After=systemd-modules-load.service
 Wants=systemd-modules-load.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/dgx-fan-control daemon
-ExecStop=/usr/local/sbin/dgx-fan-control automatic
 Restart=on-failure
-RestartSec=5s
-TimeoutStopSec=15s
+RestartPreventExitStatus=69
+RestartSec=30s
+TimeoutStopSec=30s
 CapabilityBoundingSet=
 LockPersonality=yes
 NoNewPrivileges=yes
