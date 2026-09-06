@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kernel_release="${KERNEL_RELEASE:-$(uname -r)}"
+kernel_build="/lib/modules/${kernel_release}/build"
+key_dir="${DGX_MOK_DIR:-${HOME}/.local/share/dgx-spark-fan-control/keys}"
+private_key="${key_dir}/MOK.priv"
+certificate="${key_dir}/MOK.der"
+sign_file="${kernel_build}/scripts/sign-file"
+module="${root}/kernel/dgx_ec_fan_control.ko"
+
+for path in "$kernel_build" "$private_key" "$certificate" "$sign_file"; do
+  if [[ ! -e "$path" ]]; then
+    echo "required path is missing: $path" >&2
+    exit 1
+  fi
+done
+if [[ "$(stat -c '%a' "$private_key")" != 600 ]]; then
+  echo "refusing private key without mode 0600: $private_key" >&2
+  exit 1
+fi
+
+# mokutil's exit status is the contract; do not parse localized output.
+if ! mokutil --test-key "$certificate"; then
+  echo "enroll the signing certificate before building a load candidate" >&2
+  exit 1
+fi
+
+make -C "${root}/kernel" KDIR="$kernel_build" clean
+make -C "${root}/kernel" KDIR="$kernel_build"
+"$sign_file" sha256 "$private_key" "$certificate" "$module"
+echo "built and signed for ${kernel_release} (not installed or loaded):"
+modinfo "$module" | grep -E '^(filename|version|vermagic|signer|sig_key|sig_hashalgo):'

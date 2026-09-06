@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+
+set -euo pipefail
+
+umask 077
+
+key_dir="${DGX_MOK_DIR:-${HOME}/.local/share/dgx-spark-fan-control/keys}"
+mkdir -p -- "${key_dir}"
+private_key="${key_dir}/MOK.priv"
+certificate="${key_dir}/MOK.der"
+
+if [[ -e "${private_key}" || -e "${certificate}" ]]; then
+	printf 'Refusing to overwrite existing MOK.priv or MOK.der in %s\n' \
+		"${key_dir}" >&2
+	exit 1
+fi
+
+keygen_tmp=$(mktemp -d "${key_dir}/.keygen.XXXXXX")
+cleanup()
+{
+	rm -rf -- "${keygen_tmp}"
+}
+trap cleanup EXIT
+
+tmp_private_key="${keygen_tmp}/MOK.priv"
+tmp_certificate="${keygen_tmp}/MOK.der"
+
+openssl req \
+	-subj '/CN=DGX Spark local module signing/' \
+	-new \
+	-x509 \
+	-newkey rsa:2048 \
+	-nodes \
+	-days 36500 \
+	-addext 'subjectKeyIdentifier=hash' \
+	-addext 'authorityKeyIdentifier=keyid:always,issuer' \
+	-addext 'basicConstraints=critical,CA:FALSE' \
+	-addext 'extendedKeyUsage=codeSigning,1.3.6.1.4.1.2312.16.1.2' \
+	-outform DER \
+	-keyout "${tmp_private_key}" \
+	-out "${tmp_certificate}"
+
+private_public_hash=$(
+	openssl pkey -in "${tmp_private_key}" -pubout -outform DER 2>/dev/null |
+		sha256sum | awk '{print $1}'
+)
+certificate_public_hash=$(
+	openssl x509 -inform DER -in "${tmp_certificate}" -pubkey -noout |
+		openssl pkey -pubin -outform DER 2>/dev/null |
+		sha256sum | awk '{print $1}'
+)
+
+if [[ "${private_public_hash}" != "${certificate_public_hash}" ]]; then
+	printf 'Generated private key and certificate do not match\n' >&2
+	exit 1
+fi
+
+chmod 0600 "${tmp_private_key}"
+chmod 0644 "${tmp_certificate}"
+mv -- "${tmp_private_key}" "${private_key}"
+mv -- "${tmp_certificate}" "${certificate}"
+
+printf 'Generated module-signing key pair in %s\n' "${key_dir}"
+openssl x509 -inform DER -in "${certificate}" -noout \
+	-subject -fingerprint -sha256

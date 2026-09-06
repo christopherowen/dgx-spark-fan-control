@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 -m unittest discover -s "${root}/tests" -v
+bash -n "${root}/scripts/check" "${root}/scripts/build-sign" \
+  "${root}/scripts/generate-signing-key"

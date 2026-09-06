@@ -1,0 +1,31 @@
+[Unit]
+Description=DGX Spark additive fan-floor controller
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dgx-fan-control daemon
+ExecStop=/usr/local/sbin/dgx-fan-control automatic
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+CapabilityBoundingSet=
+LockPersonality=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

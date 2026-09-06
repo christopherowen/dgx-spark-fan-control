@@ -1,0 +1,17 @@
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+__pycache__/
+.pytest_cache/
+.venv/
+# Signing material belongs outside the checkout.
+*.priv
+*.pem
+*.key
+*.der
+.keygen.*/
