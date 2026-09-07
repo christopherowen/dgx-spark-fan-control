@@ -1,5 +1,27 @@
 # Validation and provenance
 
+## Prevention investigation, 2026-09-07
+
+The firmware replay passed **24 scenarios**, including sixteen paired cases
+that isolate metadata ordering for a single read or write. All four
+original-order early-completion cases remain pending with an idle mailbox;
+the four matching metadata-first cases complete. Normal timing passes with
+both orders. This is an offline causal experiment, not a hardware firmware fix.
+See the [analysis](firmware-pending-analysis.md#isolating-the-trigger).
+
+The passive FF-A recorder compiled and ran for approximately 60 seconds on
+each Spark with both direct-message probes enabled. Each observed 30 floor
+reads and 60 cached polls, all successful, and no other calls to partition
+`0x8003` in those windows. Its failure-trigger branch has not been exercised
+against a live wedge; no fault was induced to test it. No runtime controller,
+kernel module, or firmware was changed for this investigation.
+
+At **18:21:13 UTC**, both hosts attached the same seven probes for a bounded
+24-hour capture under transient unit `dgx-ec-ffa-capture-20260907.service`.
+Both recorders were verified running. They exit on persistent pending or
+duration expiry and perform no recovery. The normal **22 project tests**,
+shell syntax checks, and changed documentation link checks also passed.
+
 ## Original hardware work
 
 The release extraction comes from the original `kernel-mod` project at commit

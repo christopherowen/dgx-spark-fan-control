@@ -123,6 +123,76 @@ or read failures. This project cannot repair those internal writes through its
 current fan-floor interface. Host pacing is an experiment, not a demonstrated
 fix for this ordering defect: the problematic order is inside one request.
 
+## Isolating the trigger
+
+The 2026-09-07 recurrence began in the daemon's operation-4 floor read. The
+last logged fan change was state 6 → 5 at **12:29:53 UTC**; the first timeout
+was **12:58:02 UTC**, about 28 minutes later. The traceback identifies
+`current = read_state(cooling_device)`. The first kernel timeout has no
+preflight-failure message; later attempts explicitly fail operation-4
+preflight. This is consistent with a newly submitted read losing completion,
+rather than a fan-setting transition failing at that moment. Historical logs
+do not record every successful transaction or secure-world callback.
+
+Version 0.1.1 authenticates the current floor on every two-second daemon pass
+to handle resume/reset and uncertain writes. Version 0.1.0 retained the
+daemon's last state between changes. The newer behavior adds approximately
+1,800 floor-read submissions per hour while the floor is unchanged. That is
+additional exposure to the same submit path, not evidence of an EC queue
+overflow or a measured probability of failure.
+
+Passive Linux FF-A tracing on both hosts, **18:15–18:16 UTC**, observed the
+following independently on each host:
+
+| Existing traffic in approximately 60 seconds | Count | Call duration |
+| --- | ---: | --- |
+| Operation-4 submissions | 30 | 256–512 microseconds |
+| Cached packet polls, including preflight | 60 | 16–128 microseconds |
+| Other traced calls to secure partition `0x8003` | 0 | — |
+| Transport errors or nonzero response status | 0 | — |
+
+Both FF-A direct-message entry points were probed. These observations show no
+burst or competing Linux FF-A caller in those healthy windows. Cached polls
+are not additional EC packet submissions. The trace cannot see autonomous
+secure-firmware activity, EC-side scheduling, or earlier traffic at the failure.
+
+### Controlled ordering experiment
+
+The expanded replay adds sixteen paired cases. Each begins with one normally
+completed read or write, then submits one isolated operation-4 read or
+operation-5 write. The model supplies either normal or early completion. The
+paired intervention changes **only** when the existing metadata instructions
+execute: before sender argument setup instead of after the sender returns.
+All original sender, wrapper, event-drain, and completion instructions remain
+the same, as do the modeled EC response and timing.
+
+| Completion timing | Original metadata order | Metadata initialized first |
+| --- | --- | --- |
+| After submit returns | Completes normally | Completes normally |
+| Inside the write wrapper | Mailbox acknowledged, poll stays 2 | Mailbox acknowledged, poll returns 0 |
+
+The result holds for both operations and both preceding response lengths
+(zero or two bytes). Successful corrected reads also return the exact modeled
+floor. Thus an isolated read is sufficient for this firmware defect in the
+model: flooding, a concurrent writer, a recent floor change, and injected I/O
+errors are not required. One hundred subsequent cached polls do not contact
+the EC or change a stuck outcome. Host delay after submission cannot change
+an ordering that has already occurred inside that submission.
+
+This intervention runs existing instructions in a different order **only in
+emulated memory**. It is a causal experiment, not an installable patch. A real
+firmware correction must additionally handle failed submissions, old
+outstanding responses, synchronization, and response-body read errors; merely
+moving two stores is not a complete fix.
+
+The production trigger remains unobserved inside secure firmware. The replay
+proves a reachable defect and its ordering dependency, while the hardware's
+idle-mailbox/stale-pending signature supports that explanation. It does not
+exclude another path to the same state. The next useful live evidence is a
+bounded passive request history at onset, not another blind recovery loop.
+The [FF-A recorder](../research/trace/README.md) captures that history without
+issuing requests or modifying controller behavior.
+
 ## Live recovery on both Sparks
 
 The [one-shot diagnostic](../research/mailbox/README.md) kept each 0.1.0 driver
@@ -215,10 +285,13 @@ uv run --no-project --with unicorn==2.1.4 python research/replay_pending.py \
 ```
 
 [`research/replay_pending.py`](../research/replay_pending.py) verifies the exact
-capsule SHA-256 and runs **eight scenarios**. It executes the original submit,
+capsule SHA-256 and runs **24 scenarios**: eight failure/recovery cases and
+sixteen controlled ordering cases. It executes the original submit,
 sender, write wrapper, event drain, callback chain, completion, and poll machine
 code. Only peripheral writes, EC reads, virtual-wire reception, and diagnostic
-logging are substituted. The EC is a model, not an emulation of its Cortex-M
+logging are substituted in the original-order cases. The paired ordering
+intervention additionally redirects emulator execution as described above.
+The EC is a model, not an emulation of its Cortex-M
 firmware; hardware scheduling and low-level controller behavior are not proven.
 
 The test asserts that 100 repeated polls issue zero EC accesses, checks both

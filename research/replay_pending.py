@@ -4,7 +4,9 @@
 
 Requires unicorn. Reads an independently downloaded socfw.cap, verifies its
 hash, and executes selected original AArch64 routines in emulated memory.
-No firmware bytes, device accesses, downloads, or firmware modifications.
+No firmware bytes are distributed, and no devices are accessed. The ordering
+experiment redirects execution only inside the emulator; it is not a flashable
+patch or a complete firmware fix.
 """
 import argparse
 import hashlib
@@ -29,7 +31,7 @@ STOP = SCRATCH + 0xF000
 
 
 class Replay:
-    def __init__(self, image, early=False, error=None):
+    def __init__(self, image, early=False, error=None, metadata_first=False):
         self.uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         self.uc.mem_map(BASE, 0x70000)
         self.uc.mem_write(BASE, image)
@@ -38,6 +40,8 @@ class Replay:
         self.uc.mem_map(SCRATCH, 0x10000)
         self.early = early
         self.error = error
+        self.metadata_first = metadata_first
+        self.metadata_phase = "before"
         self.mailbox = 0
         self.packet = bytes((7, 5, 0, 0x9C, 0x18))
         self.floor = 4500
@@ -58,6 +62,23 @@ class Replay:
             self.trace.append({"pc": hex(self.reg(UC_ARM64_REG_PC)), "pending": value})
 
     def instruction(self, uc, address, size, user_data):
+        # Causal intervention: execute the ORIGINAL metadata instructions before
+        # setting up the sender arguments, then omit their post-send execution.
+        # No EC timing, callback, data, or polling behavior changes between pairs.
+        # This only tests successful submission ordering, not error unwinding or
+        # arbitration of an old outstanding response in a production patch.
+        if self.metadata_first:
+            if address == 0x93974540 and self.metadata_phase == "before":
+                self.metadata_phase = "initializing"
+                uc.reg_write(UC_ARM64_REG_PC, 0x93974560)
+                return
+            if address == 0x93974580 and self.metadata_phase == "initializing":
+                self.metadata_phase = "sent"
+                uc.reg_write(UC_ARM64_REG_PC, 0x93974540)
+                return
+            if address == 0x93974560 and self.metadata_phase == "sent":
+                uc.reg_write(UC_ARM64_REG_PC, 0x93974588)
+                return
         if address == 0x9396792C:  # peripheral write boundary below real wrapper
             self.io_calls += 1
             target, length, source = (self.reg(r) for r in
@@ -121,6 +142,7 @@ class Replay:
         return self.reg(UC_ARM64_REG_X0)
 
     def submit(self, operation=5):
+        self.metadata_phase = "before"
         # Real outer packet handler takes an FF-A message with payload at +24.
         payload = bytes((1, 5, 2, 0, 0x9C, 0x18)) if operation == 5 else bytes((1, 4, 0, 2))
         self.uc.mem_write(SCRATCH + 24, payload)
@@ -179,6 +201,48 @@ def replay(image):
     assert model.submit(4) == 0x0A and model.poll() == 2
     results.append({"case": "busy_mailbox_read_resubmit", "submit_status": 0x0A,
                     "poll_state": 2, "ec_floor": model.floor})
+
+    # Same isolated request, same EC response, only metadata ordering changes.
+    # Prime with a completed read or write to exercise both old output lengths.
+    # There are no other clients, overlapping requests, or injected I/O errors.
+    for previous_operation in (4, 5):
+        for operation in (4, 5):
+            for early in (False, True):
+                for metadata_first in (False, True):
+                    model = Replay(image)
+                    assert model.submit(previous_operation) == 0
+                    model.complete()
+                    assert model.poll() == 0 and model.mailbox == 0
+                    model.trace.clear()
+                    model.early = early
+                    model.metadata_first = metadata_first
+                    assert model.submit(operation) == 0
+                    if not early:
+                        model.complete()
+                    before = model.io_calls
+                    expected = 2 if early and not metadata_first else 0
+                    assert [model.poll() for _ in range(100)] == [expected] * 100
+                    assert model.io_calls == before
+                    assert model.mailbox == 0
+                    writes = [event["pending"] for event in model.trace]
+                    assert writes == ([0, 1] if expected == 2 else [1, 0])
+                    result = {
+                        "case": "isolated_request_ordering",
+                        "previous_operation": previous_operation,
+                        "operation": operation,
+                        "early_completion": early,
+                        "metadata_first": metadata_first,
+                        "poll_state": expected,
+                        "mailbox_status": model.mailbox,
+                        "ec_floor": model.floor,
+                        "poll_ec_accesses": model.io_calls - before,
+                        "pending_writes": model.trace,
+                    }
+                    if operation == 4 and expected == 0:
+                        observed = int.from_bytes(model.uc.mem_read(SCRATCH + 0x101, 2), "little")
+                        assert observed == model.floor
+                        result["observed_floor"] = observed
+                    results.append(result)
     return results
 
 

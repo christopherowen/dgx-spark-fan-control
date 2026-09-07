@@ -1,0 +1,69 @@
+#!/usr/bin/env bpftrace
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Passive summary of existing calls to the EC secure partition.
+ * Does not submit FF-A requests or change fan state. Requires kernel BTF.
+ * Default duration: 60 seconds. Supply a positive duration as the first
+ * positional argument after the script path to override it.
+ * Retains the last 128 completed calls and exits on one second of pending
+ * packet polls. The ring is printed only on that trigger.
+ */
+BEGIN
+{
+  @duration = (uint64)($1 > 0 ? $1 : 60);
+  time("trace_start=%Y-%m-%dT%H:%M:%S%z\n");
+}
+kprobe:ffa_sync_send_receive2
+,kprobe:ffa_sync_send_receive
+{
+  $dev = (struct ffa_device *)arg0;
+  if ($dev->vm_id == 0x8003) {
+    @start[tid] = nsecs;
+    @message[tid] = arg1;
+    @device[tid] = $dev->id;
+    @command[tid] = *(uint8 *)arg1;
+    @operation[tid] = *(uint8 *)(arg1 + 1);
+    @calls[$dev->id, comm, @command[tid], @operation[tid]] = count();
+  }
+}
+kretprobe:ffa_sync_send_receive2
+,kretprobe:ffa_sync_send_receive
+/@start[tid]/
+{
+  $dev = @device[tid];
+  $cmd = @command[tid];
+  $op = @operation[tid];
+  $status = *(uint8 *)@message[tid];
+  $duration = (nsecs - @start[tid]) / 1000;
+  @duration_us[$dev, $cmd, $op] = hist($duration);
+  @responses[$dev, $cmd, $op, retval, $status] = count();
+  // Sequence allocation is diagnostic only: concurrent CPUs may race. Include
+  // the original monotonic start time and TID so entries remain interpretable.
+  @sequence = @sequence + 1;
+  @recent[@sequence % 128] = (@sequence, @start[tid], tid, $dev, $cmd, $op, retval, $status, $duration);
+  // Device 18 is the validated packet relay on these two hosts. Other service
+  // payloads have different meanings and must not trigger the packet alarm.
+  if ($dev == 18 && $cmd == 2 && retval == 0) {
+    if ($status == 2) {
+      if (@pending_since == 0) { @pending_since = nsecs; }
+      if (nsecs - @pending_since >= 1000000000) {
+        @pending_trigger = 1;
+        time("persistent_pending=%Y-%m-%dT%H:%M:%S%z\n");
+        exit();
+      }
+    } else { @pending_since = 0; }
+  }
+  delete(@start[tid]); delete(@message[tid]); delete(@device[tid]);
+  delete(@command[tid]); delete(@operation[tid]);
+}
+interval:s:1
+{
+  @seconds = @seconds + 1;
+  if (@seconds >= @duration) { exit(); }
+}
+END
+{
+  time("trace_end=%Y-%m-%dT%H:%M:%S%z\n");
+  if (@pending_trigger == 0) { clear(@recent); }
+  clear(@sequence); clear(@pending_since); clear(@seconds); clear(@duration);
+  clear(@start); clear(@message); clear(@device); clear(@command); clear(@operation);
+}
