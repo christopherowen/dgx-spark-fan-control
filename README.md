@@ -68,8 +68,9 @@ systemd provides boot loading and the optional performance service.
 This is an independent, experimental project, unaffiliated with NVIDIA.
 Version 0.1.1 fixes lost-write ownership recovery and resume synchronization,
 and stops persistent communication failures from causing endless service
-restarts. A firmware relay stuck pending was observed on two systems running
-0.1.0; its trigger and recovery remain unqualified. See
+restarts. Both affected 0.1.0 systems were recovered without rebooting on
+2026-09-07 and upgraded to 0.1.1. The underlying firmware ordering defect remains;
+long-term stability is not yet qualified. See
 [recovery instructions](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 Orderly stop, suspend, reboot, and module removal request and verify automatic
 control. A hard crash or transport failure can prevent restoration; manual

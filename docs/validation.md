@@ -7,7 +7,8 @@ The release extraction comes from the original `kernel-mod` project at commit
 driver, Python controller, systemd files, and eight original tests were copied
 without behavior changes. The public build/signing scripts and documentation
 were adapted for standalone use. Exploratory modules, private operational
-notes, signing material, and firmware binaries are not part of this repository.
+notes, signing material, and firmware binaries were not part of the extraction.
+Subsequent bounded research tooling is published under `research/`.
 
 The original notes record these results on two NVIDIA DGX Sparks, board P4242,
 DGX OS 7.5.0, kernel `6.17.0-1029-nvidia`, EC 3.5.8, SoC firmware 2.155.11,
@@ -96,7 +97,8 @@ The 0.1.1 module built with `W=1` and was signed using an already-enrolled local
 certificate on **both Sparks** against `6.17.0-1029-nvidia`. Version, aarch64
 vermagic, and signature identity were verified. The only build notices were the
 same GCC command-name difference and missing `vmlinux` described above. These
-signed modules remain staged, **not installed or loaded**.
+signed modules were initially staged without installation. The live recovery
+below subsequently made it possible to install and load them safely.
 
 The updated Python command and systemd unit were installed on both systems,
 with backups of the previous files. Against the existing stuck relay and loaded
@@ -104,16 +106,40 @@ with backups of the previous files. Against the existing stuck relay and loaded
 restoration, exited 69, and remained failed with zero restarts. This validates
 failure containment on hardware; it does **not** establish recovered fan control.
 The current floor could not be verified. No reboot or cold power cycle was
-performed, and the new kernel driver's successful live operation and long-term
-soak remain outstanding.
+performed during that failure-containment check.
+
+## Rebootless recovery and 0.1.1 live checks
+
+On **2026-09-07**, both Sparks were recovered through the version-pinned
+[mailbox diagnostic](../research/mailbox/README.md). Both physical mailboxes
+were idle despite cached packet state 2. One read-only retry per machine
+recovered communication. Explicit removal of each observed floor passed two
+physical/cached comparisons before UNSET and two afterward. Old modules
+confirmed automatic policy on orderly removal; both 0.1.1 modules then loaded
+in state 0. See the [firmware analysis](firmware-pending-analysis.md#live-recovery-on-both-sparks)
+for timestamps, floors, the initially refused restoration, and limits of inference.
+
+Both systems passed manual **0 → 12 → 0**, measured **9000/13500 RPM** after
+eight seconds at state 12, and restarted the performance service successfully.
+Both retained their original boot IDs and had zero service restarts. No firmware
+was flashed and unrelated workloads were not restarted. Long-term soak remains
+outstanding.
+
+All **22 tests** and shell syntax checks passed. The additional compiled-C test
+executes the actual diagnostic functions against a strict fake FF-A peer,
+including busy/unreadable mailboxes, invalid clocks and headers, bounded retry,
+conflicting modes, physical/cache disagreement, ownership mismatch, and failed
+UNSET readback. It checks that diagnostic recovery issues no setters and that
+explicit restoration can only send one UNSET. The helper also built with `W=1`
+against the exact target headers on both Sparks.
 
 ## Known limitations
 
 The subsequent [firmware investigation](firmware-pending-analysis.md) reproduced
 eight scenarios by executing original SoC 2.155.11 instructions against a
 simulated EC boundary. It demonstrates an early-completion ordering defect and
-a conditional idle-mailbox recovery path. It does not establish the live trigger
-or validate recovery on either Spark.
+a conditional idle-mailbox recovery path. The subsequent hardware observations
+validate that path on both Sparks, but do not establish the historical trigger.
 
 - This is an out-of-tree kernel module tied to the observed platform and APIs.
   DKMS can rebuild it for new kernels, but there is no promise of compatibility
@@ -124,11 +150,11 @@ or validate recovery on either Spark.
 - Restoration accepts only the last confirmed floor, the driver's own uncertain
   attempted floor, or an unset clamp. An unrelated value requires operator
   investigation. Use only one policy writer.
-- A permanently pending firmware transaction cannot be recovered by these
-  ownership fixes. No safe software reset of that relay has been established;
-  the live trigger remains unconfirmed. A firmware ordering defect and conditional
-  recovery were reproduced offline, as described above. Version 0.1.1 handles the
-  failure with bounded retries and an explicit failed service.
+- Version 0.1.1's ownership fixes do not themselves clear permanently pending
+  firmware state. The operator helper recovered the observed idle-mailbox case;
+  busy/unreadable mailboxes and notification failures remain outside that
+  demonstrated recovery. The firmware race is still present. Version 0.1.1
+  contains recurring failures with bounded retries and an explicit failed service.
 - The daemon ignores individual unreadable or implausible thermal sensors.
   Maximum cooling is requested only when no valid sensor readings remain.
 - Fan RPM is not an exact setpoint. Firmware demand, fan saturation, and ramp

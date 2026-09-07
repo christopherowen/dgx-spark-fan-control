@@ -1,10 +1,11 @@
 # Why the firmware can remain pending
 
-Offline analysis, 2026-09-06. This describes **SoC firmware 2.155.11** and an
-emulated EC boundary. It identifies a reproducible firmware ordering defect;
-it does **not** prove which failure occurred on either live Spark. No new
-packets, resets, module replacements, or firmware writes were sent to hardware
-during this investigation.
+Offline analysis, 2026-09-06; live recovery, 2026-09-07. This describes **SoC
+firmware 2.155.11**. Original instructions reproduce an ordering defect against
+an emulated EC boundary. Subsequent hardware diagnosis found stale pending flags
+with idle mailboxes on both Sparks, and recovered both without rebooting.
+The exact historical event ordering was not captured, so the reproduced race
+remains a supported explanation rather than a proven trace of either failure.
 
 ## Finding
 
@@ -91,7 +92,7 @@ However, the sender checks the **physical mailbox**, not the cached pending flag
 In the offline replay, a stale pending flag plus an idle mailbox allows a new
 **read-lower-floor** request. When that request completes after submission,
 pending clears and its exact floor is returned. This is a conditional recovery
-candidate without rebooting; it is not a validated operating procedure.
+path without rebooting, subsequently demonstrated on both affected Sparks.
 Recovering relay communication is also separate from reconciling an uncertain
 floor in an already-loaded 0.1.0 driver. Successful packet recovery alone must
 not be reported as restored automatic fan control.
@@ -101,12 +102,11 @@ does not recover. Blindly repeating it would not address the missing completion.
 The current Linux driver deliberately prevents either submission while its
 preflight reports pending. Do not remove that check globally.
 
-The next discriminating observation is a fixed, one-byte read of the physical
+The discriminating observation is a fixed, one-byte read of the physical
 mailbox status at `0x06000504` through the existing secure OEM read service.
 The OEM bulk-read handler (`0x93973260`, command 12) reaches the same eSPI read
-wrapper used by the packet sender. This provides a static candidate for that
-diagnostic, but the exact live result and its effect on queued events remain
-unverified. These read wrappers themselves drain eSPI events, so even a read
+wrapper used by the packet sender. Live reads returned `0x08` on both machines:
+bits 0–1 were clear while packet polls remained 2. These read wrappers themselves drain eSPI events, so even a read
 may advance a queued completion; it is not a passive secure-memory snapshot.
 
 A bounded diagnostic should retain the existing packet owner, exclude competing
@@ -122,6 +122,53 @@ response capture. It also needs a defined error/recovery path for notification
 or read failures. This project cannot repair those internal writes through its
 current fan-floor interface. Host pacing is an experiment, not a demonstrated
 fix for this ordering defect: the problematic order is inside one request.
+
+## Live recovery on both Sparks
+
+The [one-shot diagnostic](../research/mailbox/README.md) kept each 0.1.0 driver
+loaded, retained its module reference, and held its transaction mutex. Its
+private prefix offsets were checked against the installed modules' DWARF;
+loaded and installed source versions matched. Secure Boot signatures were
+generated locally with the already-enrolled keys.
+
+| Observation (UTC, 2026-09-07) | Spark 1 | Spark 2 |
+| --- | --- | --- |
+| Driver's remembered state | 12 / 13,500 RPM floor | 5 / 6,300 RPM floor |
+| Two physical mailbox reads | `0x08`, `0x08` | `0x08`, `0x08` |
+| Cached packet poll before retry | 2 → 2 | 2 → 2 |
+| One read-only retry | 09:18:56; submit 0, poll 0 | 09:23:20; submit 0, poll 0 |
+| Returned EC floor | `0x3057` / 12,375 RPM | `0x1fa4` / 8,100 RPM |
+| Verified automatic restoration | 09:22:04 | 09:23:29 |
+
+The fixed six-byte read at `0x06000788` returned a plausible BCD clock, not board
+identity. The time-reader code at `0x93977954` confirms this use. Shared-mailbox
+responses included family `0x10`/`0x11`; the dispatcher accepts `0x10..0x14` at
+`0x93977478`. Its response buffer need not retain the last fan reply.
+
+Each recovery submitted exactly one operation-4 read after checking idle status,
+a plausible clock, and a recognized response family. No fan setting changed
+during this step. Poll completed normally and telemetry resumed.
+
+Both EC floors differed from the old driver's confirmed state. These values
+match the policy's possible next step (one step down or two steps up), but that
+alone does not prove ownership. An explicit operator recovery selected the
+observed floor to remove. The helper required two fresh floor reads, with
+matching physical response headers/payloads and cached replies, before sending
+one operation-5 **UNSET**. It verified UNSET twice through both paths afterward.
+It never changed the old driver's private state or wrote a new RPM target.
+
+The first restoration attempt on Spark 1 refused with `ESTALE` before any
+setter. The added comparison logging was absent on that attempt, so the exact
+failed comparison is unknown; a later attempt passed every comparison. The
+shared response buffer can be overwritten by another service, which is a
+reason to refuse rather than accept an unverifiable floor.
+
+Both old modules then independently confirmed automatic policy during orderly
+removal. Version 0.1.1 loaded in state 0. Each passed a manual 0 → 12 → 0 test,
+with measured 9,000/13,500 RPM after eight seconds at maximum, followed by
+successful service startup. Boot IDs remained unchanged. This demonstrates
+recovery and basic operation; it does not establish long-term stability or fix
+the internal firmware race.
 
 ## Reproduce offline
 

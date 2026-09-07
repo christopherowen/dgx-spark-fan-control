@@ -57,7 +57,7 @@ This differs from a failed FF-A call or submission status `0x0a` (mailbox busy).
 The live trigger remains unconfirmed. Further offline analysis reproduced a
 firmware ordering defect that can leave the pending flag set **after the EC
 has completed the request**. See the [firmware analysis](firmware-pending-analysis.md)
-for that distinction, other failure paths, and a conditional recovery candidate.
+for that distinction, other failure paths, and the subsequent live recovery.
 
 Version 0.1.1 logs preflight timeouts separately from submission failures. The
 daemon retries transient transport errors after two and four seconds; after
@@ -70,13 +70,18 @@ Systemd does not restart exit 69. Unexpected process crashes have a 30-second
 restart delay and a three-start limit per five minutes. SIGTERM lets the daemon
 perform its own cleanup, without a competing `ExecStop` writer.
 
-Retain the kernel and service logs. A maintenance shutdown and cold power cycle
-remains a recovery candidate; recovery of this particular pending condition has
-not yet been validated. Offline replay also identified a possible recovery
-without rebooting when the physical mailbox is idle; this requires a bounded
-diagnostic and has not been attempted on hardware. Do not unload/reload to discard ownership
-state, remove the pending check, or submit raw reset packets. After firmware
-communication is restored and status verifies state 0, restart explicitly:
+On 2026-09-07, both machines had an **idle physical mailbox with a stale pending
+flag**. A guarded, one-shot read-lower-floor retry recovered communication on
+each. Their old drivers also remembered a different floor from the EC's actual
+floor, so recovery required separately identifying and removing that floor,
+verifying automatic control, and upgrading the driver. Neither machine rebooted.
+
+Retain the kernel and service logs. The [operator diagnostic](../research/mailbox/README.md)
+documents the version-pinned procedure and refusal conditions. It is research
+tooling, not an automatic daemon recovery loop. A busy or unreadable mailbox
+is outside the demonstrated recovery. Do not unload/reload to discard ownership
+state, remove the driver's pending check, or submit raw reset packets. After
+communication and ownership are reconciled and status verifies state 0, restart explicitly:
 
 ```sh
 dgx-fan-control status                    # require state=0/12
