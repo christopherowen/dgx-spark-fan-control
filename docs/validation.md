@@ -122,8 +122,14 @@ for timestamps, floors, the initially refused restoration, and limits of inferen
 Both systems passed manual **0 → 12 → 0**, measured **9000/13500 RPM** after
 eight seconds at state 12, and restarted the performance service successfully.
 Both retained their original boot IDs and had zero service restarts. No firmware
-was flashed and unrelated workloads were not restarted. Long-term soak remains
-outstanding.
+was flashed and unrelated workloads were not restarted. The subsequent soak
+**failed on Spark 1 at 12:58 UTC**, about 3½ hours after startup: the relay wedged
+again, the daemon exited 69, and automatic restoration failed. At 17:59 UTC one
+guarded read retry recovered it; the normal 0.1.1 driver then restored state 0
+and the service restarted without a reboot. Spark 2 remained running. See the
+[recurrence evidence](firmware-pending-analysis.md#recurrence-on-version-011).
+Version 0.1.1 therefore has demonstrated failure containment, not unattended
+reliability.
 
 All **22 tests** and shell syntax checks passed. The additional compiled-C test
 executes the actual diagnostic functions against a strict fake FF-A peer,

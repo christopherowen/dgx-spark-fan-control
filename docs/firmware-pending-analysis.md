@@ -170,6 +170,27 @@ successful service startup. Boot IDs remained unchanged. This demonstrates
 recovery and basic operation; it does not establish long-term stability or fix
 the internal firmware race.
 
+### Recurrence on version 0.1.1
+
+Spark 1 failed again at **12:58 UTC on 2026-09-07**, approximately 3½ hours
+after service startup. A state read timed out; the daemon exhausted its three
+attempts, failed automatic restoration, and exited 69 at 12:58:12. Systemd
+correctly performed no automatic restarts, but fan control remained unavailable
+until the next operator check. Spark 2 remained running without this failure.
+
+At **17:59:18 UTC**, the same guarded helper observed cached poll `2 → 2`,
+physical mailbox `0x08` twice, and a plausible RTC. One read-only retry completed
+with floor `0x189c` (6,300 RPM), matching the 0.1.1 driver's confirmed state 5.
+The ordinary driver command then restored automatic policy and read back state
+0; the performance service was restarted. No explicit floor-ownership override,
+module replacement, or reboot was needed. The hottest sensor was 53.8°C during
+the recovery check; fan RPM reads were unavailable while the relay was wedged.
+
+This recurrence rules out a claim of unattended reliability for 0.1.1. Its
+failure containment works, and the idle-mailbox recovery worked again, but
+operator intervention was still necessary. The observations remain consistent
+with the firmware race; they do not capture the exact internal event ordering.
+
 ## Reproduce offline
 
 The input was independently downloaded from NVIDIA's LVFS release referenced
