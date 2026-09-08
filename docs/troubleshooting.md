@@ -50,6 +50,11 @@ never completes its outstanding transaction.
 
 ## Persistent pending and service exit 69
 
+Version 0.1.3 emits a numbered incident with recent transaction history,
+submit/poll timing, mailbox/response evidence, and the recovery outcome.
+See [incident logging](incident-logging.md) for fields, validity masks, and
+journal collection commands. Preserve these logs before restarting or reloading.
+
 A separate failure was observed on two systems running version 0.1.0: the stock
 ACPI EC time read still worked, while successful FF-A poll calls continuously
 returned packet state `2` (pending). No new fan request was being submitted.

@@ -146,6 +146,9 @@ This tolerates the demonstrated idle-mailbox condition without modifying
 firmware. It cannot recover a genuinely busy/unreadable mailbox or prove that
 all ordinary firmware replies are fresh. Physical-response cross-checking is
 specific to recovery; this version does not add OEM reads to healthy polling.
+Version 0.1.3 adds [incident evidence](incident-logging.md) around the same
+recovery path, including the triggering transaction history and the existing
+physical observations, without additional EC requests.
 
 ## Related primary documentation
 

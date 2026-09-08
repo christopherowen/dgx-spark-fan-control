@@ -1,5 +1,31 @@
 # Validation and provenance
 
+## Version 0.1.3 incident evidence
+
+On **2026-09-08**, all **23 project tests** passed, including **43 actual-C
+transaction/logging scenarios**. The existing 40 failure/recovery cases retain
+their request-count and ownership assertions. Three new logging scenarios
+verify quiet healthy polling, bounded chronological history after wraparound,
+trigger operation/phase, submit timing, pending-poll counts, physical bytes,
+uncertain setter evidence, partial-read validity masks and failure stage,
+cooldown suppression, and a new incident ID on the next admitted attempt.
+Their FF-A counts show that recording evidence adds no hardware requests.
+
+Both Sparks built and signed 0.1.3 against `6.17.0-1029-nvidia` with `W=1`.
+The usual compiler command-name and unavailable-`vmlinux` notices remained;
+there were no driver compilation errors. Logging adds fixed per-device memory
+and host timing/printing work; it cannot expose internal secure-world ordering.
+The [logging guide](incident-logging.md) explains fields and their limits.
+
+The signed build was installed and loaded on Spark 1 at **08:46 UTC** and
+Spark 2 at **08:47 UTC**, after each old controller verified automatic/unset.
+Loaded and installed `srcversion` matched **`A1ED4009D06119FE4AC778A`** on both
+hosts, and deployed C source hashes matched the checkout. Both services
+returned to state 5 with zero automatic restarts; boot IDs were unchanged.
+The existing passive recorders stayed active. No live fault was induced;
+incident contents were checked against simulated failures, and a natural
+0.1.3 incident had not yet occurred at closeout.
+
 ## Version 0.1.2 guarded recovery
 
 On **2026-09-08**, all **22 project tests** passed. The actual C transaction

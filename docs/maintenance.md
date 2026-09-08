@@ -19,7 +19,7 @@ Before rebooting into a new kernel, set its **exact installed release name**
 # Replace the example with the kernel you are about to boot.
 new_kernel="6.17.0-1029-nvidia"
 sudo apt-get install "linux-headers-$new_kernel"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.2 -k "$new_kernel"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.3 -k "$new_kernel"
 dkms status -m dgx-spark-fan-control
 modinfo -k "$new_kernel" -F vermagic dgx_ec_fan_control
 modinfo -k "$new_kernel" -F signer dgx_ec_fan_control
@@ -90,7 +90,7 @@ Then follow the route you originally installed:
   when upgrading from 0.1.0 (check `dkms status` for your installed version),
   then repeat the source-copy, add, build, and install steps in the installation
   guide. Use the
-  version in the new checkout's `dkms.conf` (currently `0.1.2`) wherever the
+  version in the new checkout's `dkms.conf` (currently `0.1.3`) wherever the
   commands name a version. This also refreshes a changed checkout that retains
   the same version; `git pull` alone does not refresh DKMS's stored source.
   Build for every additional installed kernel you intend to boot.
@@ -144,7 +144,7 @@ inspect and restore a failed state.
 For DKMS (substitute your installed version if different):
 
 ```sh
-sudo dkms remove -m dgx-spark-fan-control -v 0.1.2 --all
+sudo dkms remove -m dgx-spark-fan-control -v 0.1.3 --all
 dkms status -m dgx-spark-fan-control
 ```
 
@@ -156,7 +156,7 @@ sudo depmod -a
 ```
 
 Repeat manual removal for other kernels where you installed it. DKMS source
-under `/usr/src/dgx-spark-fan-control-0.1.2` can be removed separately once no
+under `/usr/src/dgx-spark-fan-control-0.1.3` can be removed separately once no
 registered version uses it.
 
 ### 3. Remove startup entries and the userland command

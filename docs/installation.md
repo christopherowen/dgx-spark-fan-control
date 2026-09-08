@@ -145,13 +145,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.2/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.2/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.3/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.3/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.2/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.2
-sudo dkms build -m dgx-spark-fan-control -v 0.1.2 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.2 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.3/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.3
+sudo dkms build -m dgx-spark-fan-control -v 0.1.3 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.3 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```

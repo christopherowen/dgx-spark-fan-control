@@ -17,10 +17,12 @@
 #include <linux/hwmon.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/reboot.h>
+#include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/thermal.h>
 #include <linux/types.h>
@@ -63,6 +65,8 @@
 #define DGX_EC_MAILBOX_STATUS		0x06000504U
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
+#define DGX_EC_TRACE_LENGTH		16U
+#define DGX_EC_DRIVER_VERSION		"0.1.3"
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
@@ -98,6 +102,16 @@ struct dgx_ec_fan_capabilities {
 	__le16 fan1_max;
 } __packed;
 
+/* Fixed-size, in-memory history only. Printed at a paced recovery incident. */
+struct dgx_ec_trace {
+	u64 seq, start_ns, submit_ns, end_ns;
+	u32 polls, pending;
+	int pid, cpu, transport, poll_transport, sp_status, result;
+	u16 floor;
+	u8 operation, input_length, output_length, first_poll, last_poll;
+	bool submitted;
+};
+
 struct dgx_ec_fan_control_data {
 	struct ffa_device *ffa_dev;
 	struct thermal_cooling_device *cooling_dev;
@@ -113,7 +127,63 @@ struct dgx_ec_fan_control_data {
 	bool recovery_unverified;
 	unsigned long next_recovery;
 	u32 recovery_count;
+	u64 incident, trace_seq, submissions[8], last_write_ns;
+	u8 requested_operation;
+	const char *request_phase;
+	struct dgx_ec_trace trace[DGX_EC_TRACE_LENGTH];
 };
+
+static void dgx_ec_trace_begin(struct dgx_ec_fan_control_data *data,
+			       u8 operation, bool submitted)
+{
+	struct dgx_ec_trace *t = &data->trace[data->trace_seq % DGX_EC_TRACE_LENGTH];
+
+	memset(t, 0, sizeof(*t));
+	t->seq = ++data->trace_seq;
+	t->start_ns = ktime_get_ns();
+	t->pid = task_pid_nr(current);
+	t->cpu = raw_smp_processor_id();
+	t->operation = operation;
+	t->submitted = submitted;
+	t->sp_status = -1; /* Not observed, including transport failures. */
+	t->result = -EINPROGRESS;
+	t->first_poll = t->last_poll = 0xff;
+}
+
+static void dgx_ec_log_trace(struct dgx_ec_fan_control_data *data,
+			     const struct dgx_ec_trace *t)
+{
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu tx=%llu phase=%s op=%#x in=%u out=%u floor=%#x pid=%d cpu=%d start_ns=%llu submit_us=%llu elapsed_us=%llu transport=%d sp=%d polls=%u pending=%u first=%#x last=%#x poll_transport=%d result=%d\n",
+		data->incident, t->seq, t->submitted ? "submit" : "preflight",
+		t->operation, t->input_length, t->output_length, t->floor,
+		t->pid, t->cpu, t->start_ns, t->submit_ns / 1000,
+		(t->end_ns - t->start_ns) / 1000, t->transport, t->sp_status,
+		t->polls, t->pending, t->first_poll, t->last_poll, t->poll_transport, t->result);
+}
+
+static void dgx_ec_log_incident(struct dgx_ec_fan_control_data *data)
+{
+	u64 now = ktime_get_ns();
+	u64 first = data->trace_seq > DGX_EC_TRACE_LENGTH ?
+		data->trace_seq - DGX_EC_TRACE_LENGTH : 0;
+	u64 seq;
+
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu begin driver=%s op=%#x phase=%s mono_ns=%llu confirmed_state=%lu attempted_floor=%#x uncertain=%u unverified=%u telemetry_valid=%u cached_rpm=%u,%u telemetry_age_ms=%u\n",
+		data->incident, DGX_EC_DRIVER_VERSION, data->requested_operation, data->request_phase,
+		now, data->current_state, data->attempted_floor, data->floor_uncertain,
+		data->recovery_unverified, data->telemetry_valid, data->rpm[0], data->rpm[1],
+		jiffies_to_msecs(jiffies - data->last_updated));
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu totals caps=%llu floor_reads=%llu floor_writes=%llu telemetry=%llu last_write_attempt_age_ms=%llu recoveries=%u cooldown_ms=%u\n",
+		data->incident, data->submissions[1], data->submissions[4],
+		data->submissions[5], data->submissions[7],
+		data->submissions[5] ? (now - data->last_write_ns) / 1000000 : 0,
+		data->recovery_count, DGX_EC_RECOVERY_COOLDOWN_MS);
+	for (seq = first; seq < data->trace_seq; seq++)
+		dgx_ec_log_trace(data, &data->trace[seq % DGX_EC_TRACE_LENGTH]);
+}
 
 static bool dgx_ec_is_supported_platform(void)
 {
@@ -169,14 +239,31 @@ static int dgx_ec_packet_poll(struct ffa_device *ffa_dev, u8 *state,
 	return 0;
 }
 
-static int dgx_ec_submit_status(struct ffa_device *ffa_dev,
+static int dgx_ec_submit_status(struct dgx_ec_fan_control_data *data,
 				struct ffa_send_direct_data2 *message)
 {
+	struct ffa_device *ffa_dev = data->ffa_dev;
+	struct dgx_ec_trace *t;
 	u8 *raw = (u8 *)message->data;
 	u8 operation = raw[1];
 	int ret;
 
+	data->request_phase = "completion";
+	dgx_ec_trace_begin(data, operation, true);
+	t = &data->trace[(data->trace_seq - 1) % DGX_EC_TRACE_LENGTH];
+	t->input_length = raw[2];
+	t->output_length = raw[3];
+	if (operation < ARRAY_SIZE(data->submissions))
+		data->submissions[operation]++;
+	if (operation == DGX_EC_FAN_SET_LOWER_LIMIT) {
+		t->floor = get_unaligned_le16(raw + 4);
+		data->last_write_ns = t->start_ns;
+	}
 	ret = ffa_dev->ops->msg_ops->sync_send_receive2(ffa_dev, message);
+	t->end_ns = ktime_get_ns();
+	t->submit_ns = t->end_ns - t->start_ns;
+	t->transport = ret;
+	t->result = ret;
 	if (ret) {
 		dev_warn_ratelimited(&ffa_dev->dev,
 			"FF-A submit operation=%#x failed: %d\n",
@@ -185,44 +272,62 @@ static int dgx_ec_submit_status(struct ffa_device *ffa_dev,
 	}
 
 	ret = get_unaligned_le32(raw);
+	t->sp_status = ret;
 	if (ret)
 		dev_warn_ratelimited(&ffa_dev->dev,
 			"packet submit operation=%#x status=%#x\n",
 			operation, ret);
 	if (ret == DGX_EC_PACKET_SP_ESPI_READ_FAILED)
-		return -EIO;
-	if (ret == DGX_EC_PACKET_SP_MAILBOX_BUSY)
-		return -EBUSY;
-	if (ret)
-		return -EREMOTEIO;
-
-	return 0;
+		ret = -EIO;
+	else if (ret == DGX_EC_PACKET_SP_MAILBOX_BUSY)
+		ret = -EBUSY;
+	else if (ret)
+		ret = -EREMOTEIO;
+	t->result = ret;
+	return ret;
 }
 
-static int dgx_ec_wait_for_completion(struct ffa_device *ffa_dev,
+static int dgx_ec_wait_for_completion(struct dgx_ec_fan_control_data *data,
 				      void *output, size_t output_length)
 {
+	struct ffa_device *ffa_dev = data->ffa_dev;
+	struct dgx_ec_trace *t = &data->trace[(data->trace_seq - 1) % DGX_EC_TRACE_LENGTH];
 	unsigned int attempt;
-	u8 state;
+	u8 state = 0xff;
 	int ret;
 
 	for (attempt = 0; attempt < DGX_EC_PACKET_POLL_ATTEMPTS; attempt++) {
 		ret = dgx_ec_packet_poll(ffa_dev, &state, output, output_length);
+		t->poll_transport = ret;
+		t->polls++;
 		if (ret)
-			return ret;
+			goto done;
+		if (t->polls == 1)
+			t->first_poll = state;
+		t->last_poll = state;
 		if (state == DGX_EC_PACKET_COMPLETE)
-			return 0;
-		if (state == DGX_EC_PACKET_EC_ERROR)
-			return -EREMOTEIO;
-		if (state != DGX_EC_PACKET_PENDING)
-			return -EBADMSG;
+			goto done;
+		if (state == DGX_EC_PACKET_EC_ERROR) {
+			ret = -EREMOTEIO;
+			goto done;
+		}
+		if (state != DGX_EC_PACKET_PENDING) {
+			ret = -EBADMSG;
+			goto done;
+		}
+		t->pending++;
 		msleep(DGX_EC_PACKET_POLL_DELAY_MS);
 	}
 
 	dev_warn_ratelimited(&ffa_dev->dev,
-		"packet poll timed out: state=%#x after %u polls\n",
+		"packet poll timed out: tx=%llu op=%#x phase=%s state=%#x after %u polls\n",
+		t->seq, t->operation, t->submitted ? "completion" : "preflight",
 		state, DGX_EC_PACKET_POLL_ATTEMPTS);
-	return -ETIMEDOUT;
+	ret = -ETIMEDOUT;
+done:
+	t->result = ret;
+	t->end_ns = ktime_get_ns();
+	return ret;
 }
 
 static int dgx_ec_reconcile_floor(struct dgx_ec_fan_control_data *data, u16 floor);
@@ -301,7 +406,7 @@ static int dgx_ec_valid_rtc(const u8 *rtc)
 /* Exactly one read, with no preflight or recursive recovery. The only caller
  * allowed to bypass cached pending establishes physical idle independently.
  */
-static int dgx_ec_submit_read(struct ffa_device *ffa_dev, u8 operation,
+static int dgx_ec_submit_read(struct dgx_ec_fan_control_data *data, u8 operation,
 			      size_t output_length, void *output)
 {
 	struct ffa_send_direct_data2 message = { 0 };
@@ -311,39 +416,57 @@ static int dgx_ec_submit_read(struct ffa_device *ffa_dev, u8 operation,
 	raw[0] = DGX_EC_PACKET_SUBMIT_COMMAND;
 	raw[1] = operation;
 	raw[3] = output_length;
-	ret = dgx_ec_submit_status(ffa_dev, &message);
+	ret = dgx_ec_submit_status(data, &message);
 	if (ret)
 		return ret;
-	return dgx_ec_wait_for_completion(ffa_dev, output, output_length);
+	return dgx_ec_wait_for_completion(data, output, output_length);
 }
 
 static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
 			       struct ffa_device *oem, u16 *floor)
 {
-	u8 before, after, status1, status2, rtc[6], header[5], reply[2];
+	u8 before = 0xff, after = 0xff, status1 = 0xff, status2 = 0xff, final_status = 0xff;
+	u8 rtc[6] = { 0 }, header[5] = { 0 }, final_header[5] = { 0 }, reply[2] = { 0 };
+	u32 valid = 0;
+	u64 seq = data->trace_seq;
+	const char *stage = "poll-before";
 	int ret;
 
 	ret = dgx_ec_packet_poll(data->ffa_dev, &before, NULL, 0);
 	if (ret)
-		return ret;
-	if (before != DGX_EC_PACKET_PENDING && before != DGX_EC_PACKET_COMPLETE)
-		return -EBADMSG;
+		goto out;
+	valid |= 1U << 0;
+	if (before != DGX_EC_PACKET_PENDING && before != DGX_EC_PACKET_COMPLETE) {
+		ret = -EBADMSG;
+		goto out;
+	}
+	stage = "rtc";
 	ret = dgx_ec_read_fixed(oem, DGX_EC_RTC, sizeof(rtc), rtc);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 1;
+	stage = "status-before";
 	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status1);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 2;
+	stage = "response-before";
 	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_RESPONSE, sizeof(header), header);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 3;
 	msleep(DGX_EC_RECOVERY_OBSERVE_MS);
+	stage = "status-after";
 	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status2);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 4;
+	stage = "poll-after";
 	ret = dgx_ec_packet_poll(data->ffa_dev, &after, NULL, 0);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 5;
+	stage = "idle-guard";
 	/* OEM errors can masquerade as zero bytes. Require independent canaries.
 	 * Reads may drain a late completion, so pending -> complete is admissible.
 	 * The sender also checks mailbox busy at submission, closing that race.
@@ -352,43 +475,78 @@ static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
 	    status1 != status2 || (status2 & 3) || !dgx_ec_valid_rtc(rtc) ||
 	    !((header[0] == 7 && (header[1] == 1 || header[1] == 4 ||
 				 header[1] == 5 || header[1] == 7)) ||
-	      (header[0] >= 0x10 && header[0] <= 0x14)))
-		return -EAGAIN;
+	      (header[0] >= 0x10 && header[0] <= 0x14))) {
+		ret = -EAGAIN;
+		goto out;
+	}
 
-	ret = dgx_ec_submit_read(data->ffa_dev, DGX_EC_FAN_GET_LOWER_LIMIT,
+	stage = "recovery-read";
+	ret = dgx_ec_submit_read(data, DGX_EC_FAN_GET_LOWER_LIMIT,
 				 sizeof(reply), reply);
 	if (ret)
-		return ret;
-	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_RESPONSE, sizeof(header), header);
+		goto out;
+	valid |= 1U << 6;
+	stage = "response-final";
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_RESPONSE, sizeof(final_header), final_header);
 	if (ret)
-		return ret;
-	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status2);
+		goto out;
+	valid |= 1U << 7;
+	stage = "status-final";
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &final_status);
 	if (ret)
-		return ret;
+		goto out;
+	valid |= 1U << 8;
+	stage = "reply-guard";
 	/* A shared response overwritten by another service is a refusal. Cached
 	 * success alone cannot authenticate a reply after firmware read failure.
 	 */
-	if ((status2 & 3) || header[0] != 7 || header[1] != 4 || header[2] ||
-	    memcmp(reply, header + 3, sizeof(reply)))
-		return -ESTALE;
+	if ((final_status & 3) || final_header[0] != 7 || final_header[1] != 4 || final_header[2] ||
+	    memcmp(reply, final_header + 3, sizeof(reply))) {
+		ret = -ESTALE;
+		goto out;
+	}
 	*floor = get_unaligned_le16(reply);
-	return dgx_ec_reconcile_floor(data, *floor);
+	stage = "ownership";
+	ret = dgx_ec_reconcile_floor(data, *floor);
+out:
+	/* All fields are initialized; the mask marks successful boundary reads,
+	 * not trustworthy content. Log existing observations only, with no new I/O.
+	 */
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu observation stage=%s ret=%d valid=%#x poll=%#x,%#x mailbox=%#x,%#x,%#x rtc=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		data->incident, stage, ret, valid, before, after, status1, status2, final_status,
+		rtc[0], rtc[1], rtc[2], rtc[3], rtc[4], rtc[5]);
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu response_before=%02x:%02x:%02x:%02x:%02x response_final=%02x:%02x:%02x:%02x:%02x cached_floor=%#x\n",
+		data->incident, header[0], header[1], header[2], header[3], header[4],
+		final_header[0], final_header[1], final_header[2], final_header[3], final_header[4],
+		get_unaligned_le16(reply));
+	if (data->trace_seq != seq)
+		dgx_ec_log_trace(data, &data->trace[(data->trace_seq - 1) % DGX_EC_TRACE_LENGTH]);
+	return ret;
 }
 
 static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *floor)
 {
 	struct ffa_device *oem;
+	u64 started;
 	int ret;
 
-	data->telemetry_valid = false;
-	if (data->recovery_attempted && time_before(jiffies, data->next_recovery))
+	if (data->recovery_attempted && time_before(jiffies, data->next_recovery)) {
+		data->telemetry_valid = false;
 		return -ETIMEDOUT;
+	}
 	data->recovery_attempted = true;
 	data->next_recovery = jiffies + msecs_to_jiffies(DGX_EC_RECOVERY_COOLDOWN_MS);
+	started = ktime_get_ns();
+	data->incident++;
+	dgx_ec_log_incident(data);
+	data->telemetry_valid = false;
 	oem = dgx_ec_recovery_peer_get(data);
 	if (IS_ERR(oem)) {
-		dev_warn_ratelimited(&data->ffa_dev->dev,
-			"pending recovery unavailable: OEM service %ld\n", PTR_ERR(oem));
+		dev_warn(&data->ffa_dev->dev,
+			"incident=%llu end stage=oem-service ret=%ld elapsed_us=%llu\n",
+			data->incident, PTR_ERR(oem), (ktime_get_ns() - started) / 1000);
 		return -ETIMEDOUT;
 	}
 	/* A failed physical cross-check must not be bypassed by a later caller
@@ -397,6 +555,9 @@ static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *flo
 	data->recovery_unverified = true;
 	ret = dgx_ec_recover_idle(data, oem, floor);
 	dgx_ec_recovery_peer_put(oem);
+	dev_warn(&data->ffa_dev->dev,
+		"incident=%llu end ret=%d elapsed_us=%llu\n",
+		data->incident, ret, (ktime_get_ns() - started) / 1000);
 	if (ret)
 		dev_warn_ratelimited(&data->ffa_dev->dev,
 			"pending recovery refused/failed: %d; cooldown %u ms\n",
@@ -413,19 +574,22 @@ static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *flo
 
 static int dgx_ec_preflight(struct dgx_ec_fan_control_data *data, u8 operation)
 {
-	struct ffa_device *ffa_dev = data->ffa_dev;
 	u16 floor;
 	int ret;
 
+	data->requested_operation = operation;
+	data->request_phase = "blocked";
 	if (data->recovery_unverified)
 		return dgx_ec_recover_pending(data, &floor);
 
+	data->request_phase = "preflight";
+	dgx_ec_trace_begin(data, operation, false);
 	/* Drain a late completion before another request can reuse the relay. */
-	ret = dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	ret = dgx_ec_wait_for_completion(data, NULL, 0);
 	if (ret == -ETIMEDOUT)
 		ret = dgx_ec_recover_pending(data, &floor);
 	if (ret)
-		dev_warn_ratelimited(&ffa_dev->dev,
+		dev_warn_ratelimited(&data->ffa_dev->dev,
 			"operation=%#x preflight failed: %d; original request not submitted\n",
 			operation, ret);
 	return ret;
@@ -456,7 +620,7 @@ static int dgx_ec_read_operation(struct dgx_ec_fan_control_data *data, u8 operat
 	if (ret)
 		return ret;
 
-	ret = dgx_ec_submit_read(data->ffa_dev, operation, output_length, output);
+	ret = dgx_ec_submit_read(data, operation, output_length, output);
 	if (ret != -ETIMEDOUT)
 		return ret;
 	ret = dgx_ec_recover_pending(data, &floor);
@@ -469,13 +633,12 @@ static int dgx_ec_read_operation(struct dgx_ec_fan_control_data *data, u8 operat
 	/* Capabilities/telemetry must be read anew; never reinterpret the recovery
 	 * floor as the original operation's response. One retry, no recursion.
 	 */
-	return dgx_ec_submit_read(data->ffa_dev, operation, output_length, output);
+	return dgx_ec_submit_read(data, operation, output_length, output);
 }
 
 static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 				  u16 value)
 {
-	struct ffa_device *ffa_dev = data->ffa_dev;
 	struct ffa_send_direct_data2 message = { 0 };
 	u8 *raw = (u8 *)message.data;
 	u16 floor;
@@ -493,11 +656,11 @@ static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 	/* A transport error does not prove that the EC rejected this write. */
 	data->attempted_floor = value;
 	data->floor_uncertain = true;
-	ret = dgx_ec_submit_status(ffa_dev, &message);
+	ret = dgx_ec_submit_status(data, &message);
 	if (ret)
 		return ret;
 
-	ret = dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	ret = dgx_ec_wait_for_completion(data, NULL, 0);
 	if (ret != -ETIMEDOUT)
 		return ret;
 	ret = dgx_ec_recover_pending(data, &floor);
@@ -939,4 +1102,4 @@ MODULE_SOFTDEP("pre: arm-ffa");
 MODULE_AUTHOR("Christopher Owen");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NVIDIA DGX Spark EC additive fan-floor cooling device");
-MODULE_VERSION("0.1.2");
+MODULE_VERSION(DGX_EC_DRIVER_VERSION);

@@ -66,13 +66,15 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.2** adds bounded in-driver recovery for the observed stale-pending,
+Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
 idle-mailbox failure. It validates physical mailbox observations, submits one
 read-only recovery request, checks the reply, and reconciles floor ownership
 before continuing. Timed-out setters are never blindly replayed. Recovery
 attempts have a shared 30-second cooldown; busy, unreadable, or inconsistent
 mailboxes remain errors. The underlying firmware defect remains, and long-term
 unattended reliability is not yet qualified. See
+the [incident logs](docs/incident-logging.md), which retain recent transaction
+timing and recovery observations without extra EC traffic, and the
 [recovery instructions](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 Orderly stop, suspend, reboot, and module removal request and verify automatic
 control. A hard crash or transport failure can prevent restoration; manual
