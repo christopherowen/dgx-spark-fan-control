@@ -59,12 +59,26 @@ firmware ordering defect that can leave the pending flag set **after the EC
 has completed the request**. See the [firmware analysis](firmware-pending-analysis.md)
 for that distinction, other failure paths, and the subsequent live recovery.
 
-Version 0.1.1 logs preflight timeouts separately from submission failures. The
+Versions 0.1.1 and later log preflight timeouts separately from submission failures. The
 daemon retries transient transport errors after two and four seconds; after
 three consecutive failures it attempts automatic restoration and exits 69.
 Non-retryable errors, including an ownership mismatch, stop immediately. Both
 the initiating error and any restoration failure remain in the journal. A
 failed restoration means the current floor is **unverified**, not automatic.
+
+Version **0.1.2** first attempts [bounded driver recovery](protocol.md#bounded-stale-pending-recovery-012)
+when preflight or completion remains pending. A verified idle mailbox permits
+one read-only resynchronization; successful recovery lets the current operation
+continue without a daemon restart. The kernel logs `recovered idle-mailbox
+pending` with the verified floor and count. It never repeats a timed-out setter.
+Recovery attempts are limited to one per 30 seconds across all sysfs and
+lifecycle callers. The daemon's retry/exit behavior above remains in effect
+when recovery fails; a cooldown is not an automatic promise to retry forever.
+
+Missing or bound OEM service, busy/changing mailbox status, invalid clock or
+response bytes, another timeout, and inconsistent floor ownership all refuse
+recovery. Retain the logs when this occurs. Do not repeatedly restart the
+service to work around the cooldown or discard ownership by reloading.
 
 Systemd does not restart exit 69. Unexpected process crashes have a 30-second
 restart delay and a three-start limit per five minutes. SIGTERM lets the daemon
@@ -78,7 +92,9 @@ verifying automatic control, and upgrading the driver. Neither machine rebooted.
 
 Retain the kernel and service logs. The [operator diagnostic](../research/mailbox/README.md)
 documents the version-pinned procedure and refusal conditions. It is research
-tooling, not an automatic daemon recovery loop. A busy or unreadable mailbox
+tooling for the pinned older modules; 0.1.2 incorporates the guarded read path
+directly in its driver and does not use the helper's private-layout access.
+A busy or unreadable mailbox
 is outside the demonstrated recovery. Do not unload/reload to discard ownership
 state, remove the driver's pending check, or submit raw reset packets. After
 communication and ownership are reconciled and status verifies state 0, restart explicitly:

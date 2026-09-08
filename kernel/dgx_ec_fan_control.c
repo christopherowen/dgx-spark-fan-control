@@ -10,6 +10,7 @@
 
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/dmi.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -56,10 +57,20 @@
 #define DGX_EC_RESTORE_ATTEMPTS		3U
 #define DGX_EC_SHARED_PARTITION_ID	0x8003U
 #define DGX_EC_SHARED_PARTITION_PROPS	0x0109U
+#define DGX_EC_RECOVERY_COOLDOWN_MS	30000U
+#define DGX_EC_RECOVERY_OBSERVE_MS	100U
+#define DGX_EC_OEM_READ_COMMAND		12U
+#define DGX_EC_MAILBOX_STATUS		0x06000504U
+#define DGX_EC_MAILBOX_RESPONSE		0x06000800U
+#define DGX_EC_RTC			0x06000788U
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
 		  0x8a, 0xcb, 0x46, 0x7b, 0x60, 0x24, 0x7a, 0xc5);
+
+static const uuid_t dgx_ec_oem_uuid =
+	UUID_INIT(0x884a63a0, 0x3285, 0x4120,
+		  0x83, 0xaa, 0xee, 0xc0, 0x08, 0xa0, 0xa5, 0x46);
 
 /* State zero is automatic.  All other states are additive common RPM floors. */
 static const u16 dgx_ec_floor_states[] = {
@@ -98,6 +109,10 @@ struct dgx_ec_fan_control_data {
 	u16 attempted_floor;
 	bool floor_uncertain;
 	bool telemetry_valid;
+	bool recovery_attempted;
+	bool recovery_unverified;
+	unsigned long next_recovery;
+	u32 recovery_count;
 };
 
 static bool dgx_ec_is_supported_platform(void)
@@ -107,11 +122,12 @@ static bool dgx_ec_is_supported_platform(void)
 	       dmi_match(DMI_BOARD_NAME, "P4242");
 }
 
-static int dgx_ec_validate_transport(struct ffa_device *ffa_dev)
+static int dgx_ec_validate_transport(struct ffa_device *ffa_dev,
+				     const uuid_t *uuid)
 {
 	u32 ffa_version;
 
-	if (!uuid_equal(&ffa_dev->uuid, &dgx_ec_packet_uuid))
+	if (!uuid_equal(&ffa_dev->uuid, uuid))
 		return -ENODEV;
 
 	if (!ffa_dev->ops || !ffa_dev->ops->info_ops ||
@@ -209,25 +225,217 @@ static int dgx_ec_wait_for_completion(struct ffa_device *ffa_dev,
 	return -ETIMEDOUT;
 }
 
-static int dgx_ec_preflight(struct ffa_device *ffa_dev, u8 operation)
+static int dgx_ec_reconcile_floor(struct dgx_ec_fan_control_data *data, u16 floor);
+
+static int dgx_ec_match_oem(struct device *dev, const void *unused)
 {
+	return uuid_equal(&to_ffa_dev(dev)->uuid, &dgx_ec_oem_uuid);
+}
+
+/* The device reference survives unplug; its lock excludes binding/removal for
+ * the entire recovery. Never borrow an OEM service owned by another driver.
+ * Callers already hold the packet owner's transaction mutex.
+ */
+static struct ffa_device *dgx_ec_recovery_peer_get(struct dgx_ec_fan_control_data *data)
+{
+	struct device *dev;
 	int ret;
+
+	dev = bus_find_device(data->ffa_dev->dev.bus, NULL, NULL, dgx_ec_match_oem);
+	if (!dev)
+		return ERR_PTR(-ENODEV);
+	if (!device_trylock(dev)) {
+		put_device(dev);
+		return ERR_PTR(-EBUSY);
+	}
+	ret = !device_is_registered(dev) || dev->driver ? -EBUSY :
+		dgx_ec_validate_transport(to_ffa_dev(dev), &dgx_ec_oem_uuid);
+	if (ret) {
+		device_unlock(dev);
+		put_device(dev);
+		return ERR_PTR(ret);
+	}
+	return to_ffa_dev(dev);
+}
+
+static void dgx_ec_recovery_peer_put(struct ffa_device *oem)
+{
+	device_unlock(&oem->dev);
+	put_device(&oem->dev);
+}
+
+static int dgx_ec_read_fixed(struct ffa_device *oem, u32 address,
+			     u8 length, u8 *output)
+{
+	struct ffa_send_direct_data2 message = { 0 };
+	u8 *raw = (u8 *)message.data;
+	int ret;
+
+	/* No acknowledgement reads, writes, arbitrary addresses, or public ABI. */
+	if (!((address == DGX_EC_MAILBOX_STATUS && length == 1) ||
+	      (address == DGX_EC_MAILBOX_RESPONSE && length == 5) ||
+	      (address == DGX_EC_RTC && length == 6)))
+		return -EPERM;
+	raw[0] = DGX_EC_OEM_READ_COMMAND;
+	put_unaligned_le32(address, raw + 1);
+	put_unaligned_le32(length, raw + 5);
+	ret = oem->ops->msg_ops->sync_send_receive2(oem, &message);
+	if (!ret)
+		memcpy(output, raw, length);
+	return ret;
+}
+
+static int dgx_ec_valid_rtc(const u8 *rtc)
+{
+	static const u8 maxima[] = { 59, 59, 23, 31, 12, 99 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(maxima); i++) {
+		if ((rtc[i] & 15) > 9 || (rtc[i] >> 4) > 9 ||
+		    (rtc[i] >> 4) * 10 + (rtc[i] & 15) > maxima[i])
+			return 0;
+	}
+	return rtc[3] && rtc[4];
+}
+
+/* Exactly one read, with no preflight or recursive recovery. The only caller
+ * allowed to bypass cached pending establishes physical idle independently.
+ */
+static int dgx_ec_submit_read(struct ffa_device *ffa_dev, u8 operation,
+			      size_t output_length, void *output)
+{
+	struct ffa_send_direct_data2 message = { 0 };
+	u8 *raw = (u8 *)message.data;
+	int ret;
+
+	raw[0] = DGX_EC_PACKET_SUBMIT_COMMAND;
+	raw[1] = operation;
+	raw[3] = output_length;
+	ret = dgx_ec_submit_status(ffa_dev, &message);
+	if (ret)
+		return ret;
+	return dgx_ec_wait_for_completion(ffa_dev, output, output_length);
+}
+
+static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
+			       struct ffa_device *oem, u16 *floor)
+{
+	u8 before, after, status1, status2, rtc[6], header[5], reply[2];
+	int ret;
+
+	ret = dgx_ec_packet_poll(data->ffa_dev, &before, NULL, 0);
+	if (ret)
+		return ret;
+	if (before != DGX_EC_PACKET_PENDING && before != DGX_EC_PACKET_COMPLETE)
+		return -EBADMSG;
+	ret = dgx_ec_read_fixed(oem, DGX_EC_RTC, sizeof(rtc), rtc);
+	if (ret)
+		return ret;
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status1);
+	if (ret)
+		return ret;
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_RESPONSE, sizeof(header), header);
+	if (ret)
+		return ret;
+	msleep(DGX_EC_RECOVERY_OBSERVE_MS);
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status2);
+	if (ret)
+		return ret;
+	ret = dgx_ec_packet_poll(data->ffa_dev, &after, NULL, 0);
+	if (ret)
+		return ret;
+	/* OEM errors can masquerade as zero bytes. Require independent canaries.
+	 * Reads may drain a late completion, so pending -> complete is admissible.
+	 * The sender also checks mailbox busy at submission, closing that race.
+	 */
+	if ((after != DGX_EC_PACKET_PENDING && after != DGX_EC_PACKET_COMPLETE) ||
+	    status1 != status2 || (status2 & 3) || !dgx_ec_valid_rtc(rtc) ||
+	    !((header[0] == 7 && (header[1] == 1 || header[1] == 4 ||
+				 header[1] == 5 || header[1] == 7)) ||
+	      (header[0] >= 0x10 && header[0] <= 0x14)))
+		return -EAGAIN;
+
+	ret = dgx_ec_submit_read(data->ffa_dev, DGX_EC_FAN_GET_LOWER_LIMIT,
+				 sizeof(reply), reply);
+	if (ret)
+		return ret;
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_RESPONSE, sizeof(header), header);
+	if (ret)
+		return ret;
+	ret = dgx_ec_read_fixed(oem, DGX_EC_MAILBOX_STATUS, 1, &status2);
+	if (ret)
+		return ret;
+	/* A shared response overwritten by another service is a refusal. Cached
+	 * success alone cannot authenticate a reply after firmware read failure.
+	 */
+	if ((status2 & 3) || header[0] != 7 || header[1] != 4 || header[2] ||
+	    memcmp(reply, header + 3, sizeof(reply)))
+		return -ESTALE;
+	*floor = get_unaligned_le16(reply);
+	return dgx_ec_reconcile_floor(data, *floor);
+}
+
+static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *floor)
+{
+	struct ffa_device *oem;
+	int ret;
+
+	data->telemetry_valid = false;
+	if (data->recovery_attempted && time_before(jiffies, data->next_recovery))
+		return -ETIMEDOUT;
+	data->recovery_attempted = true;
+	data->next_recovery = jiffies + msecs_to_jiffies(DGX_EC_RECOVERY_COOLDOWN_MS);
+	oem = dgx_ec_recovery_peer_get(data);
+	if (IS_ERR(oem)) {
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"pending recovery unavailable: OEM service %ld\n", PTR_ERR(oem));
+		return -ETIMEDOUT;
+	}
+	/* A failed physical cross-check must not be bypassed by a later caller
+	 * accepting the same unauthenticated cache as an ordinary completion.
+	 */
+	data->recovery_unverified = true;
+	ret = dgx_ec_recover_idle(data, oem, floor);
+	dgx_ec_recovery_peer_put(oem);
+	if (ret)
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"pending recovery refused/failed: %d; cooldown %u ms\n",
+			ret, DGX_EC_RECOVERY_COOLDOWN_MS);
+	else {
+		data->recovery_unverified = false;
+		data->recovery_count++;
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"recovered idle-mailbox pending: floor=%#x state=%lu count=%u\n",
+			*floor, data->current_state, data->recovery_count);
+	}
+	return ret;
+}
+
+static int dgx_ec_preflight(struct dgx_ec_fan_control_data *data, u8 operation)
+{
+	struct ffa_device *ffa_dev = data->ffa_dev;
+	u16 floor;
+	int ret;
+
+	if (data->recovery_unverified)
+		return dgx_ec_recover_pending(data, &floor);
 
 	/* Drain a late completion before another request can reuse the relay. */
 	ret = dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	if (ret == -ETIMEDOUT)
+		ret = dgx_ec_recover_pending(data, &floor);
 	if (ret)
 		dev_warn_ratelimited(&ffa_dev->dev,
-			"operation=%#x preflight failed: %d; no request submitted\n",
+			"operation=%#x preflight failed: %d; original request not submitted\n",
 			operation, ret);
 	return ret;
 }
 
-static int dgx_ec_read_operation(struct ffa_device *ffa_dev, u8 operation,
+static int dgx_ec_read_operation(struct dgx_ec_fan_control_data *data, u8 operation,
 				 void *output)
 {
-	struct ffa_send_direct_data2 message = { 0 };
-	u8 *raw = (u8 *)message.data;
 	size_t output_length;
+	u16 floor;
 	int ret;
 
 	switch (operation) {
@@ -244,19 +452,24 @@ static int dgx_ec_read_operation(struct ffa_device *ffa_dev, u8 operation,
 		return -EPERM;
 	}
 
-	ret = dgx_ec_preflight(ffa_dev, operation);
+	ret = dgx_ec_preflight(data, operation);
 	if (ret)
 		return ret;
 
-	raw[0] = DGX_EC_PACKET_SUBMIT_COMMAND;
-	raw[1] = operation;
-	raw[2] = 0;
-	raw[3] = output_length;
-	ret = dgx_ec_submit_status(ffa_dev, &message);
+	ret = dgx_ec_submit_read(data->ffa_dev, operation, output_length, output);
+	if (ret != -ETIMEDOUT)
+		return ret;
+	ret = dgx_ec_recover_pending(data, &floor);
 	if (ret)
 		return ret;
-
-	return dgx_ec_wait_for_completion(ffa_dev, output, output_length);
+	if (operation == DGX_EC_FAN_GET_LOWER_LIMIT) {
+		put_unaligned_le16(floor, output);
+		return 0;
+	}
+	/* Capabilities/telemetry must be read anew; never reinterpret the recovery
+	 * floor as the original operation's response. One retry, no recursion.
+	 */
+	return dgx_ec_submit_read(data->ffa_dev, operation, output_length, output);
 }
 
 static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
@@ -265,9 +478,10 @@ static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 	struct ffa_device *ffa_dev = data->ffa_dev;
 	struct ffa_send_direct_data2 message = { 0 };
 	u8 *raw = (u8 *)message.data;
+	u16 floor;
 	int ret;
 
-	ret = dgx_ec_preflight(ffa_dev, DGX_EC_FAN_SET_LOWER_LIMIT);
+	ret = dgx_ec_preflight(data, DGX_EC_FAN_SET_LOWER_LIMIT);
 	if (ret)
 		return ret;
 
@@ -283,7 +497,14 @@ static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 	if (ret)
 		return ret;
 
-	return dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	ret = dgx_ec_wait_for_completion(ffa_dev, NULL, 0);
+	if (ret != -ETIMEDOUT)
+		return ret;
+	ret = dgx_ec_recover_pending(data, &floor);
+	if (ret)
+		return ret;
+	/* Never replay the setter: the first write may already have taken effect. */
+	return floor == value ? 0 : -EIO;
 }
 
 static int dgx_ec_read_lower_floor(struct dgx_ec_fan_control_data *data,
@@ -292,7 +513,7 @@ static int dgx_ec_read_lower_floor(struct dgx_ec_fan_control_data *data,
 	u8 limit_data[DGX_EC_FAN_LIMIT_LENGTH];
 	int ret;
 
-	ret = dgx_ec_read_operation(data->ffa_dev,
+	ret = dgx_ec_read_operation(data,
 				    DGX_EC_FAN_GET_LOWER_LIMIT, limit_data);
 	if (!ret)
 		*floor = get_unaligned_le16(limit_data);
@@ -305,7 +526,7 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 	struct dgx_ec_fan_capabilities capabilities;
 	int ret;
 
-	ret = dgx_ec_read_operation(data->ffa_dev,
+	ret = dgx_ec_read_operation(data,
 				    DGX_EC_FAN_GET_CAPABILITIES,
 				    &capabilities);
 	if (ret)
@@ -344,7 +565,7 @@ static int dgx_ec_refresh(struct dgx_ec_fan_control_data *data)
 			msecs_to_jiffies(DGX_EC_CACHE_INTERVAL_MS)))
 		return 0;
 
-	ret = dgx_ec_read_operation(data->ffa_dev,
+	ret = dgx_ec_read_operation(data,
 				    DGX_EC_FAN_GET_TELEMETRY, telemetry);
 	if (ret)
 		return ret;
@@ -609,7 +830,7 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 
 	if (!dgx_ec_is_supported_platform())
 		return -ENODEV;
-	ret = dgx_ec_validate_transport(ffa_dev);
+	ret = dgx_ec_validate_transport(ffa_dev, &dgx_ec_packet_uuid);
 	if (ret)
 		return ret;
 
@@ -718,4 +939,4 @@ MODULE_SOFTDEP("pre: arm-ffa");
 MODULE_AUTHOR("Christopher Owen");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NVIDIA DGX Spark EC additive fan-floor cooling device");
-MODULE_VERSION("0.1.1");
+MODULE_VERSION("0.1.2");

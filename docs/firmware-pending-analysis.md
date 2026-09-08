@@ -99,8 +99,10 @@ not be reported as restored automatic fan control.
 
 If the mailbox still holds a reply, the same read request returns `0x0a` and
 does not recover. Blindly repeating it would not address the missing completion.
-The current Linux driver deliberately prevents either submission while its
-preflight reports pending. Do not remove that check globally.
+Versions through 0.1.1 deliberately prevent either submission while preflight
+reports pending. Version 0.1.2 adds only the guarded idle-mailbox exception
+described in the [driver protocol](protocol.md#bounded-stale-pending-recovery-012).
+Do not remove that check globally.
 
 The discriminating observation is a fixed, one-byte read of the physical
 mailbox status at `0x06000504` through the existing secure OEM read service.
@@ -260,6 +262,26 @@ This recurrence rules out a claim of unattended reliability for 0.1.1. Its
 failure containment works, and the idle-mailbox recovery worked again, but
 operator intervention was still necessary. The observations remain consistent
 with the firmware race; they do not capture the exact internal event ordering.
+
+### Captured recurrence at 22:16 UTC
+
+The passive recorder on Spark 1 ran from **18:21:13 to 22:16:30 UTC on
+2026-09-07**, then triggered on persistent pending. Its aggregate captured
+7,052 operation-4 submissions and cached polls only; no setter or other Linux
+FF-A caller to partition `0x8003` appeared during the window. The retained
+25-second request history shows ordinary reads about two seconds apart, a
+successful preflight, and a floor-read submission accepted in 727 microseconds,
+followed by persistent poll state 2. Nearby healthy submissions took roughly
+360–395 microseconds. The longer call is consistent with extra work inside
+submission but does not prove that the completion callback ran there.
+
+On **2026-09-08 at 08:22:05 UTC**, the pinned diagnostic again found cached
+pending `2 → 2`, physical mailbox `0x08` twice, a plausible RTC, and shared
+response family `0x11`. At **08:23:09**, one guarded read recovered floor
+6,300 RPM, matching confirmed state 5. The old 0.1.1 driver then verified
+automatic/unset through its ordinary interface before replacement. No reboot
+or forced ownership override was needed. This observation further narrows the
+live failure to the relay's stale state; secure-world ordering remains inferred.
 
 ## Reproduce offline
 

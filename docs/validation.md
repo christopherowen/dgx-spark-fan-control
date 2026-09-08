@@ -1,5 +1,47 @@
 # Validation and provenance
 
+## Version 0.1.2 guarded recovery
+
+On **2026-09-08**, all **22 project tests** passed. The actual C transaction
+test now executes **40 scenarios**, including 30 new recovery cases: stale
+pending before submission, isolated read timeout, an applied or unapplied
+setter, automatic/unset recovery, late completion during observation, distinct
+capabilities/telemetry payloads, a retry that wedges again, busy or changing
+status, zero/invalid OEM data, stale/overwritten/error replies, foreign floors,
+sender rejection, each of six OEM-read transport failures, fixed-address
+refusals, and cooldown expiry.
+Tests assert bounded request counts, no recovery writes, retained ownership on
+failure, telemetry invalidation, and no repeated diagnosis during cooldown.
+Every rejected-recovery case also attempts a setter after cached pending clears
+and verifies that the unverified recovery still blocks all new submissions.
+
+Both Sparks compiled 0.1.2 with `W=1` against `6.17.0-1029-nvidia` and signed
+it with their existing enrolled certificates. There were no driver compilation
+errors; Kbuild reported the known GCC command-name difference and missing
+`vmlinux` for BTF. The C tests substitute Linux lifetime/locking and FF-A
+boundaries, so they do not prove kernel concurrency or secure-firmware timing.
+
+Both hosts passed automatic → state 12 → automatic during rollout, reaching
+9,000/13,500 RPM after eight seconds at maximum. The final signed build was
+installed for the running kernel and loaded at **08:30 UTC**; loaded and
+installed `srcversion` matched **`591D047A4087B5F270FB2B6`** on both hosts.
+Both final-build services started successfully, progressed 0 → 2 → 4 → 5,
+and reported zero automatic restarts. At 08:31:45 UTC, both read state 5 and
+6,300/6,210 RPM; the hottest sensors were 54.8°C and 52.8°C respectively.
+Boot IDs were unchanged. Previous signed 0.1.1 modules were retained locally
+for rollback after verified automatic restoration.
+
+Spark 1's pre-existing wedge was diagnosed and cleared using the pinned
+one-shot helper while its 0.1.1 owner remained loaded, followed by that owner's
+verified automatic restoration. This was required for a safe ownership
+handoff; it is **not** a live demonstration of the new driver's automatic
+recovery. No live fault was induced. The new recovery integration is verified
+against simulated failures; unattended recurrence recovery and long-term
+stability remain to be established. Fresh bounded 24-hour passive captures
+started on both hosts at 08:31 UTC under transient unit
+`dgx-ec-ffa-capture-20260908.service`; kernel recovery logs supply the verified
+outcome if the request recorder stops at timeout onset.
+
 ## Prevention investigation, 2026-09-07
 
 The firmware replay passed **24 scenarios**, including sixteen paired cases

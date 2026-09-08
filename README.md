@@ -66,12 +66,13 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version 0.1.1 fixes lost-write ownership recovery and resume synchronization,
-and stops persistent communication failures from causing endless service
-restarts. Both affected 0.1.0 systems were recovered without rebooting on
-2026-09-07 and upgraded to 0.1.1. One system wedged again after about 3½ hours
-and required another operator recovery. The underlying firmware defect remains;
-version 0.1.1 is not qualified for unattended reliability. See
+Version **0.1.2** adds bounded in-driver recovery for the observed stale-pending,
+idle-mailbox failure. It validates physical mailbox observations, submits one
+read-only recovery request, checks the reply, and reconciles floor ownership
+before continuing. Timed-out setters are never blindly replayed. Recovery
+attempts have a shared 30-second cooldown; busy, unreadable, or inconsistent
+mailboxes remain errors. The underlying firmware defect remains, and long-term
+unattended reliability is not yet qualified. See
 [recovery instructions](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 Orderly stop, suspend, reboot, and module removal request and verify automatic
 control. A hard crash or transport failure can prevent restoration; manual
