@@ -5,7 +5,12 @@
  * The embedded controller remains the fan-policy authority.  This driver can
  * only raise its common lower RPM clamp through the validated packet service;
  * it has no upper-clamp, PWM, raw-packet, or arbitrary-memory interface.
- * Cooling state zero restores the firmware's automatic/unset value.
+ * Cooling state zero restores the firmware's automatic/unset value.  It is
+ * NVIDIA's fan curve, not a request to stop the fans.  A lower clamp of zero
+ * is that stopped state: it is not one of the RPM floors below, and the EC
+ * keeps it across a warm reboot.  Probe and every automatic restoration
+ * clear it, so loading this module without the performance service stays on
+ * the firmware curve.
  */
 
 #include <linux/arm_ffa.h>
@@ -54,6 +59,7 @@
 #define DGX_EC_EXPECTED_FAN1_MIN_RPM	1890U
 #define DGX_EC_EXPECTED_FAN1_MAX_RPM	13500U
 #define DGX_EC_LIMIT_UNSET		U16_MAX
+#define DGX_EC_LIMIT_STOPPED		0U
 #define DGX_EC_MAX_PLAUSIBLE_RPM	30000U
 #define DGX_EC_RESTORE_RETRY_MS		100U
 #define DGX_EC_RESTORE_ATTEMPTS		3U
@@ -66,7 +72,7 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.3"
+#define DGX_EC_DRIVER_VERSION		"0.1.4"
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
@@ -783,9 +789,20 @@ static int dgx_ec_restore_automatic_locked(struct dgx_ec_fan_control_data *data)
 	ret = dgx_ec_read_lower_floor(data, &floor);
 	if (ret)
 		return ret;
-	ret = dgx_ec_reconcile_floor(data, floor);
-	if (ret || floor == DGX_EC_LIMIT_UNSET)
-		return ret;
+	/*
+	 * Zero is not an owned floor.  The fan minima are 1260 and 1890 RPM,
+	 * and a clamp of 0 leaves both fans stopped until an EC power cycle.
+	 * Clearing it is what makes "module loaded, service stopped" the
+	 * NVIDIA curve rather than fans off.
+	 */
+	if (floor == DGX_EC_LIMIT_STOPPED) {
+		dev_warn(&data->ffa_dev->dev,
+			 "clearing zero lower clamp; restoring NVIDIA fan curve\n");
+	} else {
+		ret = dgx_ec_reconcile_floor(data, floor);
+		if (ret || floor == DGX_EC_LIMIT_UNSET)
+			return ret;
+	}
 
 	ret = dgx_ec_write_lower_floor(data, DGX_EC_LIMIT_UNSET);
 	if (ret)
@@ -908,6 +925,19 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 	ret = dgx_ec_read_lower_floor(data, &current_floor);
 	if (ret)
 		goto unlock;
+	/*
+	 * State 0 is the firmware curve, including when the thermal core
+	 * requests it because no trip target is active.  A clamp of exactly 0
+	 * is not that curve and not an owner: the fans are stopped, so an
+	 * explicit floor may replace it.
+	 */
+	if (current_floor == DGX_EC_LIMIT_STOPPED) {
+		if (state == 0) {
+			ret = dgx_ec_restore_automatic_locked(data);
+			goto report;
+		}
+		goto apply;
+	}
 	ret = dgx_ec_reconcile_floor(data, current_floor);
 	if (ret)
 		goto unlock;
@@ -918,6 +948,7 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 		goto report;
 	}
 
+apply:
 	target_floor = dgx_ec_floor_states[state];
 	ret = dgx_ec_write_lower_floor(data, target_floor);
 	if (ret)
@@ -1011,7 +1042,11 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	ret = dgx_ec_read_lower_floor(data, &floor);
 	if (ret)
 		goto unlock;
-	if (floor != DGX_EC_LIMIT_UNSET) {
+	if (floor == DGX_EC_LIMIT_STOPPED) {
+		ret = dgx_ec_restore_automatic_locked(data);
+		if (ret)
+			goto unlock;
+	} else if (floor != DGX_EC_LIMIT_UNSET) {
 		dev_err(&ffa_dev->dev,
 			"refusing to replace existing lower floor %#x\n", floor);
 		ret = -EBUSY;
@@ -1036,6 +1071,20 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	if (IS_ERR(data->cooling_dev))
 		return dev_err_probe(&ffa_dev->dev, PTR_ERR(data->cooling_dev),
 				     "failed to register cooling device\n");
+
+	/*
+	 * Registration can bind the new device.  step_wise then steps the
+	 * state, and the thermal core's untargeted update writes state 0.
+	 * The performance service is not running yet, so put the NVIDIA
+	 * curve back before probe returns.  State 0 is that curve.
+	 */
+	ret = dgx_ec_restore_automatic(data, "module load");
+	if (ret) {
+		thermal_cooling_device_unregister(data->cooling_dev);
+		data->cooling_dev = NULL;
+		return dev_err_probe(&ffa_dev->dev, ret,
+				     "failed to leave the NVIDIA fan curve active\n");
+	}
 
 	data->reboot_notifier.notifier_call = dgx_ec_reboot_notify;
 	ret = devm_register_reboot_notifier(&ffa_dev->dev,

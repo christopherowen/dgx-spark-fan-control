@@ -114,6 +114,28 @@ sudo journalctl -u dgx-fan-control.service -n 30
 A successful restart must be followed by state, RPM, and temperature checks
 under load, automatic restoration, and a longer soak before claiming stability.
 
+## Fans stop with the module loaded and the service stopped
+
+State 0 is NVIDIA's curve. A lower clamp of exactly 0 is not: both fans stay
+stopped, `status` returns an ownership error instead of `state=0/12`, and a
+warm reboot leaves the clamp in place because the EC stays powered. Version
+0.1.4 writes the unset clamp over that 0 when the module loads and when
+`automatic` or a lifecycle restore runs. A non-zero floor that this driver did
+not set is still left untouched.
+
+Confirm with RPM, not with the cooling state alone:
+
+```sh
+dgx-fan-control status
+# then the hwmon fan1_input / fan2_input commands in the usage guide
+```
+
+The kernel log line `clearing zero lower clamp` means that latch was present
+and a restore was attempted. If both tachometers are still 0 after a
+successful `state=0/12`, the clamp is no longer the cause; use the cold
+power-cycle guidance above. Do not paper over it by pinning a permanent
+minimum floor. That abandons NVIDIA's curve whenever the service is stopped.
+
 ## Fans stay fast, or curve stops following temperature
 
 `automatic` removes the common lower clamp. Firmware hysteresis may keep the

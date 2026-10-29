@@ -1,5 +1,22 @@
 # Validation and provenance
 
+## Version 0.1.4 zero-clamp restore
+
+On **2026-10-29** the signed module was built on **dgx4** with DKMS against
+the running kernel **`7.0.0-1019-nvidia-64k`**. EC firmware was **3.5.8**
+(`0x03000508`) and SoC firmware **2.155.11** (`0x02009b0b`). A vLLM worker was
+serving. Hottest zone about **68°C**, fans **9000 / 11205 RPM** at state 10
+under 0.1.3.
+
+Stopping the service left **state 0** and the same RPM (firmware hysteresis,
+not a stop). Unloading 0.1.3 and loading 0.1.4 with the service still stopped
+logged `automatic fan policy active for module load`, read **state 0/12** with
+lower floor `0xffff`, and both fans stayed at **9000 / 11205 RPM**. No zero
+clamp was present, so the clear-zero path did not run on this host. Starting
+the service resumed the curve (state 4, **8460 / 10530 RPM**). The host
+transaction test covers a clamp of 0 being replaced by the unset value, and a
+non-zero foreign floor still being refused.
+
 ## Version 0.1.3 incident evidence
 
 On **2026-09-08**, all **23 project tests** passed, including **43 actual-C

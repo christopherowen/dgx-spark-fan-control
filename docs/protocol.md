@@ -82,20 +82,30 @@ through a fixed 13-entry state table. It never writes the upper clamp. Its
 additive guarantee is relative to the firmware policy and any existing upper
 clamp; it does not audit or repair changes made by other software.
 
-Probe requires an initially unset lower clamp. State changes authenticate the
-existing floor and read back the result. Before submitting a write, the driver
-records its attempted floor as uncertain. A later completed read may reconcile
-the last confirmed floor, that exact attempted floor, or an unset clamp. This
-allows recovery when a write was applied but its acknowledgement or readback
-failed. An unrelated value returns `ESTALE` and is never overwritten. A second
-writer using the same value cannot be distinguished, so exclusive relay
-ownership remains required.
+Probe accepts an unset lower clamp, or a clamp of exactly 0. Any other
+existing value is refused. State changes authenticate the floor and read back
+the result. Before submitting a write, the driver records its attempted floor
+as uncertain. A later completed read may reconcile the last confirmed floor,
+that exact attempted floor, or an unset clamp. This allows recovery when a
+write was applied but its acknowledgement or readback failed. An unrelated
+non-zero value returns `ESTALE` and is never overwritten. A second writer
+using the same value cannot be distinguished, so exclusive relay ownership
+remains required.
+
+A clamp of 0 is not an owner. The fan minima are 1260 and 1890 RPM, and 0
+leaves both fans stopped. The EC retains it across a warm reboot. Probe,
+`automatic`, and every other restoration write the unset value over it, so a
+loaded module whose performance service is not running is NVIDIA's curve.
+Registration of the cooling device can itself apply a state (the thermal core's
+untargeted update uses state 0, and a bound governor can step upward). Probe
+restores the unset clamp after registration, before the service is running.
 
 Restoration uses the same reconciliation and has up to three attempts on
 lifecycle paths, with 100 ms between attempts. An ownership mismatch stops
 those retries immediately. Failures are logged; restoration is not guaranteed
 after a broken transport or hard crash. The in-memory attempted value does not
-survive module removal or reboot; probe still requires an unset floor.
+survive module removal or reboot; probe still requires an unset floor or the
+zero clamp it is about to clear.
 There is no EC-side expiry timer for a manual floor.
 
 ## Bounded stale-pending recovery (0.1.2)

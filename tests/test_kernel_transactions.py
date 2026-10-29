@@ -333,6 +333,15 @@ int main(int argc, char **argv) {
   assert(dgx_ec_set_cur_state(&cdev, 0) == -ESTALE);
   assert(dgx_ec_restore_automatic(&data, "test") == -ESTALE);
   assert(write_count == 0 && physical_floor == 7777);
+ } else if (!strcmp(argv[1], "zero_clamp")) {
+  physical_floor = 0;
+  assert(dgx_ec_get_cur_state(&cdev, &state) == -ESTALE && state == 999);
+  assert(dgx_ec_restore_automatic(&data, "module load") == 0);
+  assert(physical_floor == UINT16_MAX && data.current_state == 0 && write_count == 1);
+  assert(dgx_ec_set_cur_state(&cdev, 0) == 0 && write_count == 1);
+  physical_floor = 0;
+  assert(dgx_ec_set_cur_state(&cdev, 5) == 0 && physical_floor == 6300 && write_count == 2);
+  assert(dgx_ec_set_cur_state(&cdev, 0) == 0 && physical_floor == UINT16_MAX && write_count == 3);
  } else if (!strcmp(argv[1], "foreign_during_write")) {
   foreign_after_write = 1;
   assert(dgx_ec_set_cur_state(&cdev, 5) == -EIO);
@@ -400,6 +409,7 @@ class KernelTransactionTests(unittest.TestCase):
     def test_transaction_failure_and_recovery_scenarios(self):
         for case in (
             "write_timeout", "readback_timeout", "uncertain_recovery", "foreign_floor",
+            "zero_clamp",
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (

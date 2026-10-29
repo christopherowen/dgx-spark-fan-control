@@ -66,7 +66,10 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
+Version **0.1.4** keeps a loaded module on NVIDIA's curve when the performance
+service is not running. State 0 is that curve. A latched lower clamp of 0,
+which stops both fans and survives a warm reboot, is cleared on load and on
+every automatic restore. Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
 idle-mailbox failure. It validates physical mailbox observations, submits one
 read-only recovery request, checks the reply, and reconciles floor ownership
 before continuing. Timed-out setters are never blindly replayed. Recovery

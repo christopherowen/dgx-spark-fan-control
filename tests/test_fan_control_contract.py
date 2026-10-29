@@ -39,6 +39,8 @@ class KernelContractTests(unittest.TestCase):
             "DGX_EC_EXPECTED_FAN0_MIN_RPM",
             "DGX_EC_EXPECTED_FAN1_MAX_RPM",
             "if (floor != DGX_EC_LIMIT_UNSET)",
+            "floor == DGX_EC_LIMIT_STOPPED",
+            "clearing zero lower clamp",
         ):
             self.assertIn(requirement, SOURCE)
 
@@ -46,6 +48,7 @@ class KernelContractTests(unittest.TestCase):
         self.assertIn("dgx_ec_restore_automatic(data, \"suspend\")", SOURCE)
         self.assertIn("dgx_ec_restore_automatic(data, \"reboot\")", SOURCE)
         self.assertIn("dgx_ec_restore_automatic(data, \"module removal\")", SOURCE)
+        self.assertIn("dgx_ec_restore_automatic(data, \"module load\")", SOURCE)
         self.assertIn("DGX_EC_RESTORE_ATTEMPTS", SOURCE)
         self.assertIn("thermal_cooling_device_register", SOURCE)
 

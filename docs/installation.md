@@ -145,13 +145,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.3/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.3/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.4/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.4/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.3/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.3
-sudo dkms build -m dgx-spark-fan-control -v 0.1.3 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.3 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.4/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.4
+sudo dkms build -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -221,10 +221,12 @@ sudo dgx-fan-control automatic
 dgx-fan-control status
 ```
 
-The module loads at boot in state 0 in either mode. Enabling the service adds
-our performance curve. `start`/`stop` change the current session;
-`enable`/`disable` change future boots. Disabling the service alone does not
-clear a manually set floor, which is why `automatic` is explicit above.
+The module loads at boot on NVIDIA's curve (state 0) whether or not the
+service is enabled. State 0 is that curve, not fans stopped. A latched lower
+clamp of 0 is cleared during load. Enabling the service adds our performance
+curve. `start`/`stop` change the current session; `enable`/`disable` change
+future boots. Disabling the service alone does not clear a manually set
+non-zero floor, which is why `automatic` is explicit above.
 
 For the performance service, verify startup:
 

@@ -74,7 +74,8 @@ sudo systemctl disable dgx-fan-control.service
 ```
 
 The module may stay loaded for RPM monitoring and later manual boosts. There
-is no need to unload it or reboot to return to the factory curve.
+is no need to unload it or reboot to return to the factory curve. With the
+service stopped, state 0 is that curve. It does not stop the fans.
 
 ## Wrap a job with ordinary-exit cleanup
 
