@@ -31,11 +31,15 @@ RETRYABLE_ERRNOS = frozenset((
 # second step. Firmware still takes the maximum of its own demand and this
 # additive request.
 PERFORMANCE_CURVE = (
-    (50.0, 3),   # 4,500 common RPM floor
-    (55.0, 5),   # 6,300
-    (60.0, 8),   # 9,000
-    (65.0, 10),  # 11,250 (fan 0 saturates at 9,000)
-    (70.0, 12),  # 13,500 (both fans at their maxima)
+    (0.0, 1),    # 2,700 always-on floor (never state 0: 0 RPM trap)
+    (52.0, 2),   # 3,600
+    (57.0, 3),   # 4,500
+    (62.0, 4),   # 5,400
+    (66.0, 5),   # 6,300
+    (70.0, 6),   # 7,200
+    (73.0, 8),   # 9,000
+    (76.0, 10),  # 11,250 (fan 0 saturates at 9,000)
+    (78.0, 12),  # 13,500 (both fans at their maxima)
 )
 
 LOG = logging.getLogger("dgx-fan-control")
