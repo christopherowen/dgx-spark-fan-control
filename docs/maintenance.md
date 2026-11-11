@@ -2,6 +2,11 @@
 
 [← README](../README.md) · [Installation](installation.md) · [Usage](usage.md)
 
+Automatic restoration in this guide is packet-path only. On `transport=ACPI`,
+the module neither owns the native fan device nor clears its clamps; reboot
+is the only measured release after an `_FSL` write. See the
+[ACPI usage warning](usage.md#acpi-native-firmware).
+
 A module file is built for one kernel. Installing a new file does not replace
 a module already loaded in memory. Keep NVIDIA's normal OS/firmware update
 process; check this driver's build and operation before relying on extra cooling.
@@ -19,7 +24,7 @@ Before rebooting into a new kernel, set its **exact installed release name**
 # Replace the example with the kernel you are about to boot.
 new_kernel="6.17.0-1029-nvidia"
 sudo apt-get install "linux-headers-$new_kernel"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.4 -k "$new_kernel"
+sudo dkms install -m dgx-spark-fan-control -v 0.2.0 -k "$new_kernel"
 dkms status -m dgx-spark-fan-control
 modinfo -k "$new_kernel" -F vermagic dgx_ec_fan_control
 modinfo -k "$new_kernel" -F signer dgx_ec_fan_control
@@ -90,7 +95,7 @@ Then follow the route you originally installed:
   when upgrading from 0.1.0 (check `dkms status` for your installed version),
   then repeat the source-copy, add, build, and install steps in the installation
   guide. Use the
-  version in the new checkout's `dkms.conf` (currently `0.1.4`) wherever the
+  version in the new checkout's `dkms.conf` (currently `0.2.0`) wherever the
   commands name a version. This also refreshes a changed checkout that retains
   the same version; `git pull` alone does not refresh DKMS's stored source.
   Build for every additional installed kernel you intend to boot.
@@ -144,7 +149,7 @@ inspect and restore a failed state.
 For DKMS (substitute your installed version if different):
 
 ```sh
-sudo dkms remove -m dgx-spark-fan-control -v 0.1.4 --all
+sudo dkms remove -m dgx-spark-fan-control -v 0.2.0 --all
 dkms status -m dgx-spark-fan-control
 ```
 
@@ -156,7 +161,7 @@ sudo depmod -a
 ```
 
 Repeat manual removal for other kernels where you installed it. DKMS source
-under `/usr/src/dgx-spark-fan-control-0.1.4` can be removed separately once no
+under `/usr/src/dgx-spark-fan-control-0.2.0` can be removed separately once no
 registered version uses it.
 
 ### 3. Remove startup entries and the userland command

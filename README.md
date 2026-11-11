@@ -2,10 +2,11 @@
 
 **Pre-cool your Spark, run your job, return to NVIDIA's fan curve.**
 
-Control a shared minimum fan RPM from Linux userland, or run a temperature-based
-performance curve. A small kernel driver talks to the existing firmware; a
-Python command controls it. NVIDIA's embedded controller (EC) continues to
-apply its own cooling policy throughout.
+On firmware without an ACPI fan, control a shared minimum fan RPM from Linux
+userland, or run a temperature-based performance curve. The kernel driver uses
+the existing EC packet service and a Python command controls it. When firmware
+declares an ACPI fan, the module instead selects Linux's native ACPI fan driver;
+its level interface has different, non-restorable clamp semantics.
 
 ## Start here
 
@@ -20,6 +21,11 @@ apply its own cooling policy throughout.
 | Upgrade or remove the software | [Updates and removal](docs/maintenance.md) |
 
 ## A typical session
+
+The examples below are **FF-A packet-path only**. Read the selected transport
+in `dmesg` first. With `transport=ACPI`, use the native fan device instead:
+see [ACPI levels and their one-way clamp warning](docs/usage.md#acpi-native-firmware).
+The packet daemon deliberately does not operate on ACPI levels.
 
 After [installation](docs/installation.md), stop the optional performance
 service before selecting a manual floor:
@@ -45,14 +51,17 @@ or interruption.
 
 ## What you control
 
-The driver exposes two read-only RPM sensors through Linux `hwmon`, and a
-thermal cooling device with state 0 (automatic) plus 12 common RPM floors.
+On the packet path, the driver exposes two read-only **RPM estimates** through
+Linux `hwmon`, and a thermal cooling device with state 0 (automatic) plus 12
+common RPM floors.
 These are **minimums, not exact per-fan targets**. Each fan saturates at its own
 maximum, and firmware can ask for more cooling than your floor.
 
-There is no firmware flashing, upper-clamp control, arbitrary EC memory access,
-or raw PWM interface. This cannot make the fans quieter than NVIDIA's own
-policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-floor).
+The packet path has no firmware flashing, upper-clamp control, arbitrary EC
+memory access, or raw PWM interface; it cannot reduce NVIDIA's policy demand.
+**ACPI `_FSL` differs: it writes both clamps, may cap the firmware curve, and has
+no automatic/unset level.** The module never invokes `_FSL` itself or creates a
+second writer alongside Linux's native fan driver.
 
 ## Compatibility
 
@@ -61,12 +70,26 @@ kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. Other GB10 systems,
 OEM variants, generic kernels, and future firmware are unverified. The driver
 rejects platform or protocol responses outside its observed contract.
 
+Version **0.2.0** selects native ACPI first (ACUM028 / SoC 2.158.15 declares
+FAN0/FAN1), otherwise the packet service (ACUM027 / 2.155.11 and ASUS
+0ACUM10 / 4.1.0 declare no fan). FF-A >= 1.1 is accepted; direct-message APIs
+are selected by reported version, not partition ID/properties. Logs include
+every discovered UUID/version/endpoint/properties and candidate rejection.
+**Runtime acceptance of this revision is unverified on all three variants;
+no ACUM028 or 0ACUM10 unit is available here.** Earlier ACUM027 hardware service
+measurements and the newest DSDT are evidence, not a module-bind test. See the
+[research-led plan, review and verification record](docs/firmware-agnostic-transport-plan.md).
+The ACPI request mapping 975..4350 RPM is never converted into the EC scale
+(CPU 1260..9000, rear 1890..13500). Published RPM in either path is a duty-derived
+estimate with a >5% publication filter, not a tachometer measurement.
+
 You need Python 3.10+, matching NVIDIA kernel headers and build tools, and an
 enrolled local signing certificate when Secure Boot is enabled. DKMS is optional;
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.4** keeps a loaded module on NVIDIA's curve when the performance
+On the packet path, version **0.1.4** introduced keeping a loaded module on
+NVIDIA's curve when the performance
 service is not running. State 0 is that curve. A latched lower clamp of 0,
 which stops both fans and survives a warm reboot, is cleared on load and on
 every automatic restore. Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
