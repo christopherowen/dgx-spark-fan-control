@@ -18,7 +18,7 @@ SOURCE = (ROOT / "kernel/dgx_ec_fan_control.c").read_text()
 
 
 def c_function(name):
-    start = re.search(rf"static (?:int|void) {name}\([^;{{]*\)\s*\{{", SOURCE).start()
+    start = re.search(rf"static (?:int|void) (?:__(?:init|exit) )?{name}\([^;{{]*\)\s*\{{", SOURCE).start()
     end = SOURCE.index("{", start) + 1
     depth = 1
     while depth:
@@ -40,6 +40,8 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef unsigned long long u64;
 #define U16_MAX UINT16_MAX
+#define FFA_VERSION_1_1 0x10001U
+#define FFA_VERSION_1_2 0x10002U
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define dev_info(...) ((void)0)
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -69,9 +71,16 @@ static char log_text[256];
 struct mutex { int unused; };
 struct notifier_block { int unused; };
 struct ffa_device;
+struct ffa_send_direct_data { unsigned long data0, data1, data2, data3, data4; };
 struct ffa_send_direct_data2 { unsigned long data[14]; };
-struct msg_ops { int (*sync_send_receive2)(struct ffa_device *, struct ffa_send_direct_data2 *); };
-struct ffa_ops { struct msg_ops *msg_ops; };
+struct msg_ops {
+ int (*sync_send_receive)(struct ffa_device *, struct ffa_send_direct_data *);
+ int (*sync_send_receive2)(struct ffa_device *, struct ffa_send_direct_data2 *);
+};
+static u32 version = FFA_VERSION_1_2;
+static u32 api_version_get(void) { return version; }
+struct info_ops { u32 (*api_version_get)(void); };
+struct ffa_ops { struct msg_ops *msg_ops; struct info_ops *info_ops; };
 struct ffa_device { int dev; struct ffa_ops *ops; int oem; };
 struct thermal_cooling_device { struct dgx_ec_fan_control_data *devdata; };
 static int mutex_lock_interruptible(struct mutex *m) { (void)m; return 0; }
@@ -102,6 +111,7 @@ static int mailbox = 8, changing_status, status_reads, invalid_rtc, invalid_head
 static int oem_zero, oem_fail_at, retry_stuck, wedge_operation, ignore_write, repeat_wedge;
 static int stale_reply, overwrite_reply, reply_error, sender_busy, complete_on_oem;
 static int last_operation = 4;
+static int telemetry_fill = 0xa5;
 static u16 physical_floor, reply_floor;
 static int pending_polls, stuck, submit_count, get_count, write_count;
 static int write_timeout_once, readback_timeout_once, auto_timeout_once;
@@ -139,7 +149,7 @@ static int exchange(struct ffa_device *dev, struct ffa_send_direct_data2 *messag
   if (poll_state_override >= 0) { raw[0] = poll_state_override; return 0; }
   if (stuck || pending_polls > 0) { if (pending_polls > 0) pending_polls--; raw[0] = 2; return 0; }
   if (last_operation == 7 || last_operation == 1)
-   memset(raw + 1, last_operation == 7 ? 0xa5 : 0xc1, last_operation == 7 ? 64 : 10);
+   memset(raw + 1, last_operation == 7 ? telemetry_fill : 0xc1, last_operation == 7 ? 64 : 10);
   else put_unaligned_le16(reply_floor, raw + 1);
   return 0;
  }
@@ -172,17 +182,38 @@ static int exchange(struct ffa_device *dev, struct ffa_send_direct_data2 *messag
 }
 '''
 
+LEGACY_SHIM = r'''
+static int legacy_exchange(struct ffa_device *dev, struct ffa_send_direct_data *legacy) {
+ struct ffa_send_direct_data2 message = {0};
+ memcpy(message.data, legacy, sizeof(*legacy));
+ int ret = exchange(dev, &message);
+ if (!ret) memcpy(legacy, message.data, sizeof(*legacy));
+ return ret;
+}
+'''
+
 MAIN = r'''
 int main(int argc, char **argv) {
- assert(argc == 2);
- struct msg_ops msg = {.sync_send_receive2 = exchange};
- struct ffa_ops ops = {.msg_ops = &msg};
+ assert(argc == 2 || argc == 3);
+ struct msg_ops msg = {.sync_send_receive = legacy_exchange, .sync_send_receive2 = exchange};
+ struct info_ops info = {.api_version_get = api_version_get};
+ struct ffa_ops ops = {.msg_ops = &msg, .info_ops = &info};
  struct ffa_device ffa = {.ops = &ops};
  oem_peer.ops = &ops; oem_peer.oem = 1;
+ if (argc == 3) version = FFA_VERSION_1_1;
  struct dgx_ec_fan_control_data data = {.ffa_dev = &ffa, .current_state = 3};
  struct thermal_cooling_device cdev = {.devdata = &data};
  unsigned long state = 999;
  physical_floor = reply_floor = 4500;
+ if (!strcmp(argv[1], "telemetry_estimate_not_validation")) {
+  assert(dgx_ec_refresh(&data) == 0);
+  assert(data.rpm[0] == 0xa5a5 && data.rpm[1] == 0xa5a5);
+  assert(data.telemetry_valid && write_count == 0 && peer_gets == 0);
+  data.telemetry_valid = false; telemetry_fill = 0;
+  assert(dgx_ec_refresh(&data) == 0 && data.rpm[0] == 0 && data.rpm[1] == 0);
+  assert(write_count == 0 && peer_gets == 0);
+  return 0;
+ }
  if (!strncmp(argv[1], "logging_", 8)) {
   if (!strcmp(argv[1], "logging_history")) {
    for (int i = 0; i < 20; i++) {
@@ -274,7 +305,9 @@ int main(int argc, char **argv) {
    assert(last_operation == op && submit_count == 3 && get_count == 1);
    assert(data.recovery_count == 1 && write_count == 0 && peer_gets == 1);
    if (!repeat_wedge)
-    for (int i = 0; i < (op == 7 ? 64 : 10); i++) assert(output[i] == (op == 7 ? 0xa5 : 0xc1));
+    for (int i = 0; i < (op == 7 ? 8 : 10); i++) assert(output[i] == (op == 7 ? 0xa5 : 0xc1));
+   if (!repeat_wedge && op == 7)
+    for (int i = 8; i < 64; i++) assert(output[i] == 0xff);
    return 0;
   }
   if (!strncmp(argv[1], "recovery_oem_fail_", 18)) {
@@ -390,17 +423,19 @@ class KernelTransactionTests(unittest.TestCase):
         trace = re.search(r"struct dgx_ec_trace \{.*?\n\};", SOURCE, re.S)[0]
         names = (
             "dgx_ec_trace_begin", "dgx_ec_log_trace", "dgx_ec_log_incident",
+            "dgx_ec_exchange",
             "dgx_ec_packet_poll", "dgx_ec_submit_status", "dgx_ec_wait_for_completion",
             "dgx_ec_reconcile_floor", "dgx_ec_read_fixed", "dgx_ec_valid_rtc",
             "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_recover_pending",
             "dgx_ec_preflight", "dgx_ec_read_operation", "dgx_ec_write_lower_floor",
             "dgx_ec_read_lower_floor",
+            "dgx_ec_refresh",
             "dgx_ec_restore_automatic_locked", "dgx_ec_restore_automatic",
             "dgx_ec_get_cur_state", "dgx_ec_set_cur_state",
         )
         source = root / "transactions.c"
         source.write_text(SHIM + defines + "\n" + table + "\n" + trace + "\n" + data + "\n" +
-                          "\n".join(c_function(name) for name in names) + MAIN)
+                          LEGACY_SHIM + "\n".join(c_function(name) for name in names) + MAIN)
         cls.binary = root / "transactions"
         subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
             "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(cls.binary),
@@ -410,14 +445,17 @@ class KernelTransactionTests(unittest.TestCase):
         for case in (
             "write_timeout", "readback_timeout", "uncertain_recovery", "foreign_floor",
             "zero_clamp",
+            "telemetry_estimate_not_validation",
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):
-            with self.subTest(case=case):
-                result = subprocess.run([str(self.binary), case], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
+            for api in ("1.1", "1.2"):
+                with self.subTest(case=case, api=api):
+                    args = [str(self.binary), case] + (["legacy"] if api == "1.1" else [])
+                    result = subprocess.run(args, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_incident_evidence_and_quiet_healthy_path(self):
         for case in ("logging_history", "logging_write", "logging_partial"):

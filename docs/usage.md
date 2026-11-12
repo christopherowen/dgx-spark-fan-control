@@ -2,6 +2,11 @@
 
 [← README](../README.md) · [Installation](installation.md) · [Maintenance](maintenance.md)
 
+These modes and commands apply only to `transport=FF-A packet` in `dmesg`.
+For `transport=ACPI`, use the native device described
+[below](#acpi-native-firmware); packet states and automatic restoration do
+not apply to it.
+
 There are three modes:
 
 | Mode | What controls the added floor | How to select it |
@@ -25,7 +30,7 @@ dgx-fan-control status
 
 State 12 requests the maximum common floor. The two fans can reach approximately
 **9000 and 13500 RPM** respectively. They accelerate under firmware control;
-setting a state does not instantly change their measured speed.
+setting a state does not instantly change their published RPM estimates.
 
 ### 2. Let the machine cool, then run your workload
 
@@ -36,7 +41,7 @@ watch -n 2 dgx-fan-control status
 ```
 
 Press Ctrl+C to stop watching. Allow tens of seconds for pre-cooling and check
-actual temperatures and [RPM readings](#read-the-fan-rpms); the time needed
+actual temperatures and [RPM estimates](#read-the-fan-rpms); the time needed
 varies with ambient temperature and existing load. There is no universal
 pre-cooling temperature or guaranteed performance improvement.
 
@@ -180,4 +185,36 @@ done
 ```
 
 `status` shows the requested state and hottest thermal zone; the hwmon files
-show measured RPM. If a command fails, see [troubleshooting](troubleshooting.md).
+show **estimated**, not measured, RPM. These values come from EC duty with a
+publication filter exceeding 5% and may be zero or stale; they do not prove a clamp
+write succeeded. Use control-state readback for that purpose. If a command
+fails, see [troubleshooting](troubleshooting.md).
+
+## ACPI-native firmware
+
+On ACUM028 the module selects the native Linux `acpi-fan` driver instead of
+registering `dgx_ec_fan_floor`. Keep `dgx-fan-control.service` stopped/disabled;
+its EC-floor curve and `automatic` command intentionally do not target ACPI.
+Locate each native fan through its `thermal_cooling` symlink:
+
+```sh
+for fan in /sys/bus/platform/devices/PNP0C0B:*; do
+  printf '%s: ' "$fan"
+  cat "$fan/thermal_cooling/cur_state" "$fan/thermal_cooling/max_state"
+done
+```
+
+The measured ACUM028 interface uses levels **0..100**, mapping its request to
+**975..4350 RPM**. Level 0 is the minimum level, **not automatic**. Do not map
+these numbers to packet states or the EC's CPU 1260..9000 / rear 1890..13500
+RPM estimate ranges. Native `_FST` speed is also an estimate, not a tachometer
+measurement.
+
+**Writing any native `cur_state` invokes `_FSL`, which sets both clamps and
+can cap the firmware curve. There is no ACPI unset/reset operation: a reboot
+is the only measured way to release that pin.** The module never sets a
+native state, including on load, suspend, removal or reboot, and never
+promises automatic restoration for this path. Avoid experimental writes
+without an operator-controlled reboot and an independent thermal safety plan.
+Runtime on ACUM028 remains unverified here; a declared ACPI interface and
+an emulator model are not proof that its FFH/EC service works on a real unit.

@@ -11,24 +11,49 @@ is distributed here.
 dgx-fan-control (Python, root)
   -> /sys/class/thermal/cooling_deviceN/cur_state
   -> dgx_ec_fan_control (kernel)
-  -> Arm FF-A direct message v2
+  -> Arm FF-A direct message (legacy on API 1.1, v2 on API >= 1.2)
   -> NVIDIA secure partition / EC packet relay
   -> EC common lower RPM clamp
   -> EC automatic policy and fan ramp
 ```
 
-RPM observations use the same relay and are exposed under the `dgx_ec_fan`
-hwmon device. The driver leaves the stock NVIDIA FF-A EC driver bound to its
-own services. It does not map the eSPI controller or access EC memory directly.
+Duty-derived RPM estimates use the same relay and are exposed under the
+`dgx_ec_fan` hwmon device, labelled as estimates. They are not tachometer
+measurements and never validate a clamp write, ownership, bind, or recovery.
+The driver leaves other services with their existing drivers, and does not map
+the eSPI controller or expose raw EC memory access.
 
-## Pinned transport
+## Probe-time transport selection
+
+On the supported DGX Spark DMI platform, declared `PNP0C0B` fans take priority.
+Their `_FIF` must describe revision-0 fine-grained control with a valid step,
+and `_FPS`, `_FSL`, `_FST` must exist. The module requires their native
+`acpi-fan` platform driver to be bound and uses its existing thermal interface;
+it never borrows/unregisters that cooling device, invokes `_FSL`, or creates a
+second writer. A declared but unusable fan is a diagnosed refusal, not a
+silent packet fallback. Load the native `fan` module before retrying if needed.
+
+On measured ACUM028 the native state is level 0..100 and the AML request scale
+is **975..4350 RPM** (`975 + 3375 * level / 100`). State zero is minimum,
+**not automatic**. `_FSL` writes both host clamps and no ACPI method clears
+them; reboot is the only measured release. This is not the EC's published
+estimate scale (CPU **1260..9000**, rear **1890..13500**). There is no conversion
+between these interfaces, and the packet userspace daemon is not used here.
+
+Only when no fan is declared does the module bind the packet service below.
+ACUM027 and ASUS 0ACUM10 have no fan in their measured, identical DSDTs.
+ACUM028 (newest NVIDIA capsule, SoC 2.158.15) declares FAN0/FAN1. No ACUM028
+or 0ACUM10 unit is available for runtime acceptance here; an FF-A emulator
+model cannot prove binding. See the [plan and evidence limits](firmware-agnostic-transport-plan.md).
+
+## Packet service contract
 
 | Field | Accepted value |
 | --- | --- |
 | DMI vendor / product / board match | `NVIDIA` / `NVIDIA_DGX_Spark` / `P4242` |
 | Service UUID | `78b04d80-d21d-4986-8acb-467b60247ac5` |
-| FF-A API | 1.2, 64-bit service |
-| Partition ID / properties | `0x8003` / `0x0109` |
+| FF-A API | >= 1.1, 64-bit service; legacy calls below 1.2, v2 calls at/above 1.2 |
+| Partition ID / properties | Discovered and logged, never compared against fixed constants |
 | Capabilities discriminator | 1 (exact vendor name is unknown) |
 | Unit mode | 0 (RPM) |
 | Fan 0 / fan 1 ranges | 1260–9000 / 1890–13500 RPM |
@@ -61,9 +86,13 @@ should own this relay. FF-A call duration itself is not bounded by the poll loop
 
 Capabilities contain the discriminator and unit mode, followed by four
 little-endian `u16` values: fan 0 minimum, fan 0 maximum, fan 1 minimum, fan 1
-maximum. In RPM mode, telemetry offsets 4 and 6 contain the two little-endian
-`u16` RPM readings. Other telemetry fields are not exposed. RPM observations
-are cached for one second and values above 30,000 are rejected.
+maximum. Telemetry offsets 4 and 6 contain the two little-endian `u16` RPM
+estimates. The wire request remains 64 bytes, but only its first eight response
+bytes are consumed, fitting even the legacy five-word direct-message reply.
+No unreturned telemetry suffix is exposed. Estimates are cached for one second;
+zero, large, or delayed values are not speed-based service-health checks.
+The recovered EC derives these numbers from duty, gates zero on stopped/zero
+tach, and republishes only on >5% change; it does not publish measured tach RPM.
 
 The observed operation table and lengths agree across official EC firmware
 2.4.11, 3.3.2, and 3.5.8. Live validation covered 3.5.8. Unknown responses fail
@@ -113,9 +142,12 @@ There is no EC-side expiry timer for a manual floor.
 Recovery stays under the existing transaction mutex. The driver locates OEM
 service UUID `884a63a0-3285-4120-83aa-eec008a0a546` on the same FF-A bus,
 retains its device reference, and holds its device lock throughout recovery.
-It requires the same pinned FF-A version/partition/properties and refuses a
-service already bound to another driver. No persistent OEM binding or public
-memory-access interface is added.
+It requires the same >= 1.1/64-bit service transport checks, choosing the API
+from that peer's reported version; endpoint/properties are discovery. A service
+already bound to another driver is refused. No persistent OEM binding or public
+memory-access interface is added. This is the firmware-inventory/OEM service,
+not the packet-service identity: its command-12 version reads at `0x06000760`
+and boot traffic to `0x8003` alone do not establish fan support.
 
 Only OEM command 12 reads of these fixed addresses/lengths are permitted:
 

@@ -8,6 +8,11 @@ key enrollment: it includes a firmware-screen step during reboot.
 The order is: **get the source → enroll a signing key → choose DKMS or manual
 build → load and verify → choose startup behavior**.
 
+After loading, check `dmesg` for the selected transport before enabling any
+service. `transport=ACPI` uses the native fan driver and **must not** run this
+project's packet-floor daemon or `automatic` command; read the
+[ACPI clamp warning](usage.md#acpi-native-firmware). Its level 0 is not auto.
+
 ## 1. Get the source and tools
 
 ```sh
@@ -145,13 +150,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.4/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.4/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.2.0/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.2.0/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.4/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.4
-sudo dkms build -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.2.0/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.2.0
+sudo dkms build -m dgx-spark-fan-control -v 0.2.0 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.2.0 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```

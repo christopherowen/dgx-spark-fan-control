@@ -1,5 +1,14 @@
 # Validation and provenance
 
+## Firmware-agnostic transport revision
+
+The [plan and review/build record](firmware-agnostic-transport-plan.md) describes
+version 0.2.0 and its remaining hardware acceptance. The historical records
+below are not runtime qualification of the revised binding or ACPI selection.
+All firmware-published RPM values in those records are **duty-derived estimates**,
+not tachometer measurements (recovered `thermal_update_fan_rpm`, 2026-11-11).
+Control/floor readbacks, not agreement with those estimates, validate writes.
+
 ## Version 0.1.4 zero-clamp restore
 
 On **2026-10-29** the signed module was built on **dgx4** with DKMS against

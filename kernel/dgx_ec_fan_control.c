@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * NVIDIA DGX Spark EC additive fan-floor cooling device.
+ * NVIDIA DGX Spark native-ACPI selector and EC additive fan-floor device.
+ *
+ * Declared ACPI fans stay with Linux's native driver: its states are levels,
+ * not automatic/floor states. No _FSL writes or restoration are made here.
+ * The following state/ownership contract applies ONLY to the packet path.
  *
  * The embedded controller remains the fan-policy authority.  This driver can
  * only raise its common lower RPM clamp through the validated packet service;
@@ -13,6 +17,7 @@
  * the firmware curve.
  */
 
+#include <linux/acpi.h>
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -26,6 +31,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
+#include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/sched.h>
 #include <linux/string.h>
@@ -45,6 +51,8 @@
 #define DGX_EC_FAN_CAPABILITIES_LENGTH	10U
 #define DGX_EC_FAN_LIMIT_LENGTH		2U
 #define DGX_EC_FAN_TELEMETRY_LENGTH	64U
+/* Only this prefix is consumed; it also fits a legacy five-word reply. */
+#define DGX_EC_FAN_TELEMETRY_PREFIX_LENGTH	8U
 #define DGX_EC_PACKET_POLL_ATTEMPTS	100U
 #define DGX_EC_PACKET_POLL_DELAY_MS	10U
 #define DGX_EC_CACHE_INTERVAL_MS		1000U
@@ -60,11 +68,8 @@
 #define DGX_EC_EXPECTED_FAN1_MAX_RPM	13500U
 #define DGX_EC_LIMIT_UNSET		U16_MAX
 #define DGX_EC_LIMIT_STOPPED		0U
-#define DGX_EC_MAX_PLAUSIBLE_RPM	30000U
 #define DGX_EC_RESTORE_RETRY_MS		100U
 #define DGX_EC_RESTORE_ATTEMPTS		3U
-#define DGX_EC_SHARED_PARTITION_ID	0x8003U
-#define DGX_EC_SHARED_PARTITION_PROPS	0x0109U
 #define DGX_EC_RECOVERY_COOLDOWN_MS	30000U
 #define DGX_EC_RECOVERY_OBSERVE_MS	100U
 #define DGX_EC_OEM_READ_COMMAND		12U
@@ -72,7 +77,21 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.4"
+#define DGX_EC_DRIVER_VERSION		"0.2.0"
+
+/*
+ * Transport selection. "auto" is the behaviour the firmware implies: declared
+ * ACPI fan devices are left to their own driver, and the FF-A packet path is
+ * used only where no fan device is declared. "acpi" exists for a run that must
+ * not fall through to FF-A. "probe" answers a question the firmware cannot --
+ * whether the packet service is present at all -- and does so without binding
+ * the driver, registering a cooling device or writing any register, because a
+ * writable force on a firmware whose ACPI owns the fans would make this module a
+ * concurrent writer of both clamps.
+ */
+static char *dgx_ec_transport = "auto";
+
+
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
@@ -201,29 +220,61 @@ static bool dgx_ec_is_supported_platform(void)
 static int dgx_ec_validate_transport(struct ffa_device *ffa_dev,
 				     const uuid_t *uuid)
 {
-	u32 ffa_version;
+	const char *reason = NULL;
+	u32 version = 0;
+	bool reported = ffa_dev->ops && ffa_dev->ops->info_ops &&
+			ffa_dev->ops->info_ops->api_version_get;
+
+	if (reported)
+		version = ffa_dev->ops->info_ops->api_version_get();
+	dev_info(&ffa_dev->dev,
+		 "FF-A candidate UUID=%pUb version=%s%u.%u raw=%#x vm_id=%#x properties=%#x mode=%u-bit\n",
+		 &ffa_dev->uuid, reported ? "" : "unavailable/",
+		 FFA_MAJOR_VERSION(version), FFA_MINOR_VERSION(version), version,
+		 ffa_dev->vm_id, ffa_dev->properties, ffa_dev->mode_32bit ? 32 : 64);
 
 	if (!uuid_equal(&ffa_dev->uuid, uuid))
-		return -ENODEV;
-
-	if (!ffa_dev->ops || !ffa_dev->ops->info_ops ||
-	    !ffa_dev->ops->info_ops->api_version_get ||
-	    !ffa_dev->ops->msg_ops ||
-	    !ffa_dev->ops->msg_ops->sync_send_receive2)
+		reason = "different service UUID";
+	else if (!reported)
+		reason = "missing API version operation";
+	else if ((version & BIT(31)) || version < FFA_VERSION_1_1)
+		reason = "invalid/unsupported API version (requires >= 1.1)";
+	else if (ffa_dev->mode_32bit)
+		reason = "32-bit service cannot carry the packet ABI";
+	else if (!ffa_dev->ops->msg_ops)
+		reason = "missing direct-message operations";
+	else if (version >= FFA_VERSION_1_2 ?
+		 !ffa_dev->ops->msg_ops->sync_send_receive2 :
+		 !ffa_dev->ops->msg_ops->sync_send_receive)
+		reason = version >= FFA_VERSION_1_2 ?
+			 "missing sync_send_receive2" : "missing sync_send_receive";
+	if (reason) {
+		dev_err(&ffa_dev->dev, "FF-A candidate rejected: %s\n", reason);
 		return -EOPNOTSUPP;
+	}
 
-	ffa_version = ffa_dev->ops->info_ops->api_version_get();
-	dev_info(&ffa_dev->dev,
-		 "packet service partition=%#x properties=%#x FF-A=%u.%u\n",
-		 ffa_dev->vm_id, ffa_dev->properties,
-		 FFA_MAJOR_VERSION(ffa_version), FFA_MINOR_VERSION(ffa_version));
-
-	if (ffa_version != FFA_VERSION_1_2 || ffa_dev->mode_32bit ||
-	    ffa_dev->vm_id != DGX_EC_SHARED_PARTITION_ID ||
-	    ffa_dev->properties != DGX_EC_SHARED_PARTITION_PROPS)
-		return -EOPNOTSUPP;
-
+	dev_info(&ffa_dev->dev, "FF-A candidate uses %s; endpoint/properties are discovery, pending protocol check\n",
+		 version >= FFA_VERSION_1_2 ? "sync_send_receive2" : "sync_send_receive");
 	return 0;
+}
+
+/* Every caller has validated this service; never downgrade a failed v2 call. */
+static int dgx_ec_exchange(struct ffa_device *ffa_dev,
+			    struct ffa_send_direct_data2 *message)
+{
+	struct ffa_send_direct_data legacy;
+	u32 version = ffa_dev->ops->info_ops->api_version_get();
+	int ret;
+
+	if (version >= FFA_VERSION_1_2)
+		return ffa_dev->ops->msg_ops->sync_send_receive2(ffa_dev, message);
+
+	memcpy(&legacy, message->data, sizeof(legacy));
+	ret = ffa_dev->ops->msg_ops->sync_send_receive(ffa_dev, &legacy);
+	/* Only five words were returned; consumers must not read the suffix. */
+	if (!ret)
+		memcpy(message->data, &legacy, sizeof(legacy));
+	return ret;
 }
 
 static int dgx_ec_packet_poll(struct ffa_device *ffa_dev, u8 *state,
@@ -233,8 +284,12 @@ static int dgx_ec_packet_poll(struct ffa_device *ffa_dev, u8 *state,
 	u8 *raw = (u8 *)message.data;
 	int ret;
 
+	if (output_length > sizeof(message.data) - 1 ||
+	    (ffa_dev->ops->info_ops->api_version_get() < FFA_VERSION_1_2 &&
+	     output_length > sizeof(struct ffa_send_direct_data) - 1))
+		return -EMSGSIZE;
 	raw[0] = DGX_EC_PACKET_POLL_COMMAND;
-	ret = ffa_dev->ops->msg_ops->sync_send_receive2(ffa_dev, &message);
+	ret = dgx_ec_exchange(ffa_dev, &message);
 	if (ret)
 		return ret;
 
@@ -265,7 +320,7 @@ static int dgx_ec_submit_status(struct dgx_ec_fan_control_data *data,
 		t->floor = get_unaligned_le16(raw + 4);
 		data->last_write_ns = t->start_ns;
 	}
-	ret = ffa_dev->ops->msg_ops->sync_send_receive2(ffa_dev, message);
+	ret = dgx_ec_exchange(ffa_dev, message);
 	t->end_ns = ktime_get_ns();
 	t->submit_ns = t->end_ns - t->start_ns;
 	t->transport = ret;
@@ -390,7 +445,7 @@ static int dgx_ec_read_fixed(struct ffa_device *oem, u32 address,
 	raw[0] = DGX_EC_OEM_READ_COMMAND;
 	put_unaligned_le32(address, raw + 1);
 	put_unaligned_le32(length, raw + 5);
-	ret = oem->ops->msg_ops->sync_send_receive2(oem, &message);
+	ret = dgx_ec_exchange(oem, &message);
 	if (!ret)
 		memcpy(output, raw, length);
 	return ret;
@@ -425,7 +480,10 @@ static int dgx_ec_submit_read(struct dgx_ec_fan_control_data *data, u8 operation
 	ret = dgx_ec_submit_status(data, &message);
 	if (ret)
 		return ret;
-	return dgx_ec_wait_for_completion(data, output, output_length);
+	/* Telemetry's wire length stays 64; only the two estimates are consumed. */
+	return dgx_ec_wait_for_completion(data, output,
+		operation == DGX_EC_FAN_GET_TELEMETRY ?
+		DGX_EC_FAN_TELEMETRY_PREFIX_LENGTH : output_length);
 }
 
 static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
@@ -700,6 +758,11 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 				    &capabilities);
 	if (ret)
 		return ret;
+	dev_info(&data->ffa_dev->dev,
+		 "packet capability reply revision=%u mode=%u ranges=%u..%u,%u..%u\n",
+		 capabilities.revision, capabilities.unit_mode,
+		 le16_to_cpu(capabilities.fan0_min), le16_to_cpu(capabilities.fan0_max),
+		 le16_to_cpu(capabilities.fan1_min), le16_to_cpu(capabilities.fan1_max));
 
 	if (capabilities.revision != DGX_EC_CAPABILITIES_REVISION ||
 	    capabilities.unit_mode != 0 ||
@@ -714,7 +777,7 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 		return -EBADMSG;
 
 	dev_info(&data->ffa_dev->dev,
-		 "pinned RPM capabilities fan0=%u..%u fan1=%u..%u\n",
+		 "scale=EC-RPM capabilities fan0=%u..%u fan1=%u..%u; published RPM is an estimate\n",
 		 DGX_EC_EXPECTED_FAN0_MIN_RPM,
 		 DGX_EC_EXPECTED_FAN0_MAX_RPM,
 		 DGX_EC_EXPECTED_FAN1_MIN_RPM,
@@ -724,9 +787,7 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 
 static int dgx_ec_refresh(struct dgx_ec_fan_control_data *data)
 {
-	u8 telemetry[DGX_EC_FAN_TELEMETRY_LENGTH];
-	u16 fan0_rpm;
-	u16 fan1_rpm;
+	u8 telemetry[DGX_EC_FAN_TELEMETRY_PREFIX_LENGTH];
 	int ret;
 
 	if (data->telemetry_valid &&
@@ -739,14 +800,13 @@ static int dgx_ec_refresh(struct dgx_ec_fan_control_data *data)
 	if (ret)
 		return ret;
 
-	fan0_rpm = get_unaligned_le16(telemetry + 4);
-	fan1_rpm = get_unaligned_le16(telemetry + 6);
-	if (fan0_rpm > DGX_EC_MAX_PLAUSIBLE_RPM ||
-	    fan1_rpm > DGX_EC_MAX_PLAUSIBLE_RPM)
-		return -EBADMSG;
-
-	data->rpm[0] = fan0_rpm;
-	data->rpm[1] = fan1_rpm;
+	/*
+	 * EC duty-derived estimates, not tachometer measurements. Zero and
+	 * delayed (>5% publication filter) values cannot validate service
+	 * health, clamp writes or recovery. Only the packet/floor protocol can.
+	 */
+	data->rpm[0] = get_unaligned_le16(telemetry + 4);
+	data->rpm[1] = get_unaligned_le16(telemetry + 6);
 	data->last_updated = jiffies;
 	data->telemetry_valid = true;
 	return 0;
@@ -836,7 +896,7 @@ static int dgx_ec_restore_automatic(struct dgx_ec_fan_control_data *data,
 			  reason, ret);
 	else
 		dev_info(&data->ffa_dev->dev,
-			 "automatic fan policy active for %s\n", reason);
+			 "lower clamp verified unset for %s (packet state 0)\n", reason);
 	mutex_unlock(&data->lock);
 
 	return ret;
@@ -864,13 +924,26 @@ static int dgx_ec_hwmon_read(struct device *dev,
 	return ret;
 }
 
+static int dgx_ec_hwmon_read_string(struct device *dev,
+				    enum hwmon_sensor_types type, u32 attr,
+				    int channel, const char **str)
+{
+	if (type != hwmon_fan || attr != hwmon_fan_label ||
+	    channel < 0 || channel > 1)
+		return -EOPNOTSUPP;
+	*str = channel ? "Rear RPM estimate" : "CPU RPM estimate";
+	return 0;
+}
+
 static const struct hwmon_ops dgx_ec_hwmon_ops = {
 	.visible = 0444,
 	.read = dgx_ec_hwmon_read,
+	.read_string = dgx_ec_hwmon_read_string,
 };
 
 static const struct hwmon_channel_info * const dgx_ec_hwmon_info[] = {
-	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
+	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL),
 	NULL
 };
 
@@ -1019,6 +1092,7 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 {
 	struct dgx_ec_fan_control_data *data;
 	struct device *hwmon_dev;
+	const char *stage = "capabilities";
 	u16 floor;
 	int ret;
 
@@ -1030,7 +1104,8 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 
 	data = devm_kzalloc(&ffa_dev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
-		return -ENOMEM;
+		return dev_err_probe(&ffa_dev->dev, -ENOMEM,
+				     "FF-A candidate rejected: allocating state\n");
 	data->ffa_dev = ffa_dev;
 	mutex_init(&data->lock);
 	ffa_dev_set_drvdata(ffa_dev, data);
@@ -1039,10 +1114,12 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	ret = dgx_ec_read_capabilities(data);
 	if (ret)
 		goto unlock;
+	stage = "lower-clamp read";
 	ret = dgx_ec_read_lower_floor(data, &floor);
 	if (ret)
 		goto unlock;
 	if (floor == DGX_EC_LIMIT_STOPPED) {
+		stage = "zero-clamp restoration";
 		ret = dgx_ec_restore_automatic_locked(data);
 		if (ret)
 			goto unlock;
@@ -1052,25 +1129,31 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 		ret = -EBUSY;
 		goto unlock;
 	}
+	stage = "telemetry-prefix read (RPM estimates only)";
 	ret = dgx_ec_refresh(data);
 	if (ret)
 		goto unlock;
-	dev_info(&ffa_dev->dev, "baseline fan1=%u fan2=%u RPM\n",
+	dev_info(&ffa_dev->dev, "baseline estimated fan1=%u fan2=%u RPM (not measured)\n",
 		 data->rpm[0], data->rpm[1]);
 	mutex_unlock(&data->lock);
 
 	hwmon_dev = devm_hwmon_device_register_with_info(&ffa_dev->dev,
 						 "dgx_ec_fan", data,
 						 &dgx_ec_chip_info, NULL);
-	if (IS_ERR(hwmon_dev))
-		return dev_err_probe(&ffa_dev->dev, PTR_ERR(hwmon_dev),
-				     "failed to register hwmon\n");
+	if (IS_ERR(hwmon_dev)) {
+		ret = PTR_ERR(hwmon_dev);
+		stage = "hwmon registration";
+		goto rejected;
+	}
 
 	data->cooling_dev = thermal_cooling_device_register(
 		"dgx_ec_fan_floor", data, &dgx_ec_cooling_ops);
-	if (IS_ERR(data->cooling_dev))
-		return dev_err_probe(&ffa_dev->dev, PTR_ERR(data->cooling_dev),
-				     "failed to register cooling device\n");
+	if (IS_ERR(data->cooling_dev)) {
+		ret = PTR_ERR(data->cooling_dev);
+		data->cooling_dev = NULL;
+		stage = "cooling-device registration";
+		goto rejected;
+	}
 
 	/*
 	 * Registration can bind the new device.  step_wise then steps the
@@ -1080,29 +1163,34 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	 */
 	ret = dgx_ec_restore_automatic(data, "module load");
 	if (ret) {
-		thermal_cooling_device_unregister(data->cooling_dev);
-		data->cooling_dev = NULL;
-		return dev_err_probe(&ffa_dev->dev, ret,
-				     "failed to leave the NVIDIA fan curve active\n");
+		stage = "post-registration unset-clamp verification";
+		goto unregister;
 	}
 
 	data->reboot_notifier.notifier_call = dgx_ec_reboot_notify;
 	ret = devm_register_reboot_notifier(&ffa_dev->dev,
 					    &data->reboot_notifier);
 	if (ret) {
-		thermal_cooling_device_unregister(data->cooling_dev);
-		return dev_err_probe(&ffa_dev->dev, ret,
-				     "failed to register reboot restoration\n");
+		stage = "reboot-notifier registration";
+		goto unregister;
 	}
 
 	dev_info(&ffa_dev->dev,
-		 "additive fan-floor cooling device registered in automatic state\n");
+		 "transport=FF-A packet scale=EC-RPM; fan-floor device registered, lower clamp verified unset during probe (state 0)\n");
 	return 0;
 
+unregister:
+	/* Stop thermal writers before cleanup; data/hwmon are still alive. */
+	thermal_cooling_device_unregister(data->cooling_dev);
+	data->cooling_dev = NULL;
+	dgx_ec_restore_automatic(data, "failed probe");
+	goto rejected;
 unlock:
 	mutex_unlock(&data->lock);
+rejected:
+	ffa_dev_set_drvdata(ffa_dev, NULL);
 	return dev_err_probe(&ffa_dev->dev, ret,
-			     "refusing fan-floor cooling device\n");
+			     "FF-A packet candidate rejected at %s\n", stage);
 }
 
 static void dgx_ec_fan_control_remove(struct ffa_device *ffa_dev)
@@ -1112,6 +1200,7 @@ static void dgx_ec_fan_control_remove(struct ffa_device *ffa_dev)
 	if (!data)
 		return;
 	thermal_cooling_device_unregister(data->cooling_dev);
+	data->cooling_dev = NULL;
 	dgx_ec_restore_automatic(data, "module removal");
 	dev_info(&ffa_dev->dev, "fan-floor cooling device removed\n");
 }
@@ -1132,23 +1221,250 @@ static struct ffa_driver dgx_ec_fan_control_driver = {
 	},
 };
 
+#if IS_ENABLED(CONFIG_ACPI)
+static int dgx_ec_acpi_candidate(struct acpi_device *adev)
+{
+	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	struct device *native;
+	unsigned long long minimum, maximum;
+	acpi_status status;
+	unsigned int i;
+	int ret = -EINVAL;
+
+	/* Native fan_core requires _FPS even for fine-grained control. */
+	if (!acpi_has_method(adev->handle, "_FIF") ||
+	    !acpi_has_method(adev->handle, "_FPS") ||
+	    !acpi_has_method(adev->handle, "_FSL") ||
+	    !acpi_has_method(adev->handle, "_FST")) {
+		dev_err(&adev->dev, "ACPI candidate rejected: missing _FIF/_FPS/_FSL/_FST\n");
+		return -EOPNOTSUPP;
+	}
+	status = acpi_evaluate_object(adev->handle, "_FIF", NULL, &buffer);
+	if (ACPI_FAILURE(status)) {
+		dev_err(&adev->dev, "ACPI candidate rejected: _FIF evaluation: %s\n",
+			acpi_format_exception(status));
+		kfree(buffer.pointer);
+		return -EIO;
+	}
+	obj = buffer.pointer;
+	if (!obj || obj->type != ACPI_TYPE_PACKAGE || obj->package.count != 4)
+		goto bad_fif;
+	for (i = 0; i < 4; i++)
+		if (obj->package.elements[i].type != ACPI_TYPE_INTEGER)
+			goto bad_fif;
+	if (obj->package.elements[0].integer.value != 0 ||
+	    obj->package.elements[1].integer.value != 1 ||
+	    obj->package.elements[2].integer.value < 1 ||
+	    obj->package.elements[2].integer.value > 9)
+		goto bad_fif;
+
+	dev_info(&adev->dev, "ACPI candidate scale=ACPI-_FSL level=0..100 step=%llu native_max_state=%llu; _FST RPM is an estimate, not measured\n",
+		 obj->package.elements[2].integer.value,
+		 100ULL / obj->package.elements[2].integer.value);
+	kfree(obj);
+
+	/* These vendor AML constants describe requests, never EC telemetry. */
+	if (ACPI_SUCCESS(acpi_evaluate_integer(adev->handle, "FMIN", NULL, &minimum)) &&
+	    ACPI_SUCCESS(acpi_evaluate_integer(adev->handle, "FMAX", NULL, &maximum)))
+		dev_info(&adev->dev, "scale=ACPI-_FSL declared RPM request=%llu..%llu (measured ACUM028: 975..4350); no EC-RPM conversion\n",
+			 minimum, maximum);
+	else
+		dev_info(&adev->dev, "scale=ACPI-_FSL RPM mapping unavailable; native levels only, no EC-RPM conversion\n");
+
+	/* fan_core binds a platform device, not adev->dev. Hold its reference
+	 * and device lock while checking ownership; never borrow its cdev.
+	 */
+	native = bus_find_device_by_acpi_dev(&platform_bus_type, adev);
+	if (!native) {
+		dev_err(&adev->dev, "ACPI candidate rejected: no native platform device\n");
+		return -ENODEV;
+	}
+	device_lock(native);
+	if (!device_is_bound(native) || strcmp(native->driver->name, "acpi-fan")) {
+		dev_err(&adev->dev, "ACPI candidate rejected: native acpi-fan not bound (driver=%s); load fan then reload this module\n",
+			native->driver ? native->driver->name : "none");
+		ret = -ENODEV;
+	} else {
+		dev_info(native, "transport=ACPI native acpi-fan selected; use thermal_cooling symlink, no duplicate packet cooling device\n");
+		ret = 0;
+	}
+	device_unlock(native);
+	put_device(native);
+	return ret;
+
+bad_fif:
+	dev_err(&adev->dev, "ACPI candidate rejected: _FIF is not revision-0 fine-grained control with step 1..9\n");
+	kfree(obj);
+	return ret;
+}
+#endif
+
+/* 0: absent, 1: native ACPI selected, negative: declared but unusable.
+ * Do not fall through on an ACPI failure and create a competing EC writer.
+ */
+static int dgx_ec_select_acpi(void)
+{
+#if IS_ENABLED(CONFIG_ACPI)
+	struct acpi_device *adev;
+	unsigned int found = 0;
+	int ret = 0, candidate;
+
+	for_each_acpi_dev_match(adev, "PNP0C0B", NULL, -1) {
+		found++;
+		candidate = dgx_ec_acpi_candidate(adev);
+		if (candidate && !ret)
+			ret = candidate;
+		/* The iterator drops this reference on its next invocation. */
+	}
+	if (found) {
+		/*
+		 * Native fan_core sets the state with _FSL. That method pins
+		 * BOTH host clamps; level 0 is NOT automatic. The recovered EC
+		 * has no path clearing them. Never offer packet restore here,
+		 * or set any ACPI state during probe/remove/suspend/reboot.
+		 */
+		pr_warn("dgx_ec_fan_control: ACPI _FSL writes pin both clamps until reboot; level 0 is minimum, NOT automatic; native _FST RPM is estimated\n");
+		pr_info("dgx_ec_fan_control: FF-A packet candidate UUID=%pUb not attempted: ACPI fan declared%s\n",
+			&dgx_ec_packet_uuid, ret ? " but rejected; no silent fallback" : "");
+		return ret ? ret : 1;
+	}
+	pr_info("dgx_ec_fan_control: ACPI candidate rejected: no declared PNP0C0B fan; trying FF-A packet service\n");
+#else
+	pr_info("dgx_ec_fan_control: ACPI candidate rejected: kernel lacks CONFIG_ACPI; trying FF-A packet service\n");
+#endif
+	return 0;
+}
+
+struct dgx_ec_discovery {
+	unsigned int matching;
+	unsigned int bound;
+	bool probed;
+};
+
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+static int dgx_ec_report_ffa_candidate(struct device *dev, void *context)
+{
+	struct dgx_ec_discovery *discovery = context;
+	struct ffa_device *ffa_dev = to_ffa_dev(dev);
+	bool matching = uuid_equal(&ffa_dev->uuid, &dgx_ec_packet_uuid);
+
+	device_lock(dev);
+	if (matching) {
+		discovery->matching++;
+		if (dev->driver == &dgx_ec_fan_control_driver.driver)
+			discovery->bound++;
+		else {
+			dgx_ec_validate_transport(ffa_dev, &dgx_ec_packet_uuid);
+			dev_err(dev, "FF-A packet candidate not bound: driver=%s; %s\n",
+				dev->driver ? dev->driver->name : "none",
+				discovery->probed ? "owned elsewhere or probe rejected (see stage log)" :
+				"not attempted: enumeration only; no packet driver registered");
+		}
+	} else {
+		/* Include nonmatching endpoints, so absent UUIDs are diagnosable. */
+		dgx_ec_validate_transport(ffa_dev, &dgx_ec_packet_uuid);
+	}
+	device_unlock(dev);
+	return 0;
+}
+#endif
+
+static bool dgx_ec_ffa_registered;
+
 static int __init dgx_ec_fan_control_init(void)
 {
-	if (!dgx_ec_is_supported_platform())
+	struct dgx_ec_discovery discovery = { 0 };
+	int ret;
+
+	if (strcmp(dgx_ec_transport, "auto") && strcmp(dgx_ec_transport, "acpi") &&
+	    strcmp(dgx_ec_transport, "probe")) {
+		pr_err("dgx_ec_fan_control: transport=%s is not one of auto, acpi, probe\n",
+		       dgx_ec_transport);
+		return -EINVAL;
+	}
+	if (strcmp(dgx_ec_transport, "auto"))
+		pr_warn("dgx_ec_fan_control: transport=%s forced; auto selection is the supported mode\n",
+			dgx_ec_transport);
+	if (!dgx_ec_is_supported_platform()) {
+		pr_err("dgx_ec_fan_control: candidates rejected: unsupported DMI vendor=%s product=%s board=%s\n",
+		       dmi_get_system_info(DMI_SYS_VENDOR),
+		       dmi_get_system_info(DMI_PRODUCT_NAME),
+		       dmi_get_system_info(DMI_BOARD_NAME));
 		return -ENODEV;
-	return ffa_register(&dgx_ec_fan_control_driver);
+	}
+	if (!strcmp(dgx_ec_transport, "probe")) {
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+		struct dgx_ec_discovery probe = { 0 };
+
+		bus_for_each_dev(&ffa_bus_type, NULL, &probe, dgx_ec_report_ffa_candidate);
+		pr_info("dgx_ec_fan_control: transport=probe discovery only: %u packet service(s) "
+			"UUID=%pUb matched; nothing registered, nothing written\n",
+			probe.matching, &dgx_ec_packet_uuid);
+		return 0;
+#else
+		pr_err("dgx_ec_fan_control: transport=probe needs CONFIG_ARM_FFA_TRANSPORT\n");
+		return -EOPNOTSUPP;
+#endif
+	}
+	ret = dgx_ec_select_acpi();
+	if (ret < 0)
+		return ret;
+	if (ret > 0) {
+		/* A candidate was declared and selected. A forced ACPI run must not
+		 * silently succeed where nothing was found, and must not fall through
+		 * to the packet path. */
+		return 0;
+	}
+	if (!strcmp(dgx_ec_transport, "acpi")) {
+		pr_err("dgx_ec_fan_control: transport=acpi but no ACPI fan candidate is declared\n");
+		return -ENODEV;
+	}
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+	bus_for_each_dev(&ffa_bus_type, NULL, &discovery, dgx_ec_report_ffa_candidate);
+#endif
+	if (!discovery.matching)
+		pr_err("dgx_ec_fan_control: no ACPI fan candidate and no FF-A packet service matched "
+		       "UUID=%pUb; version/vm_id/properties unavailable\n", &dgx_ec_packet_uuid);
+	if (!discovery.matching)
+		return -ENODEV;
+	ret = ffa_register(&dgx_ec_fan_control_driver);
+	if (ret) {
+		pr_err("dgx_ec_fan_control: FF-A candidate UUID=%pUb rejected: driver registration=%d; version/vm_id/properties unavailable without enumeration\n",
+		       &dgx_ec_packet_uuid, ret);
+		return ret;
+	}
+	/* A fresh census: reusing the pre-registration counts would double them, and every
+	 * matching service would look both unbound and bound in the same report. */
+	discovery = (struct dgx_ec_discovery) { .probed = true };
+#if IS_REACHABLE(CONFIG_ARM_FFA_TRANSPORT)
+	bus_for_each_dev(&ffa_bus_type, NULL, &discovery, dgx_ec_report_ffa_candidate);
+#endif
+	if (!discovery.bound) {
+		pr_err("dgx_ec_fan_control: FF-A packet candidate UUID=%pUb rejected: %u matching service(s), none bound; absent services have no reported version/vm_id/properties\n",
+		       &dgx_ec_packet_uuid, discovery.matching);
+		ffa_unregister(&dgx_ec_fan_control_driver);
+		return -ENODEV;
+	}
+	dgx_ec_ffa_registered = true;
+	return 0;
 }
 
 static void __exit dgx_ec_fan_control_exit(void)
 {
-	ffa_unregister(&dgx_ec_fan_control_driver);
+	if (dgx_ec_ffa_registered)
+		ffa_unregister(&dgx_ec_fan_control_driver);
 }
 
 module_init(dgx_ec_fan_control_init);
 module_exit(dgx_ec_fan_control_exit);
 
-MODULE_SOFTDEP("pre: arm-ffa");
+MODULE_SOFTDEP("pre: arm-ffa fan");
+module_param_named(transport, dgx_ec_transport, charp, 0444);
+MODULE_PARM_DESC(transport,
+		 "auto (default: ACPI where declared, otherwise FF-A packet), acpi (no FF-A fallthrough), "
+		 "or probe (report whether the packet service is present; binds and writes nothing)");
 MODULE_AUTHOR("Christopher Owen");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("NVIDIA DGX Spark EC additive fan-floor cooling device");
+MODULE_DESCRIPTION("DGX Spark ACPI-native or FF-A EC fan control");
 MODULE_VERSION(DGX_EC_DRIVER_VERSION);
