@@ -58,6 +58,14 @@
 #define DGX_EC_EXPECTED_FAN0_MAX_RPM	9000U
 #define DGX_EC_EXPECTED_FAN1_MIN_RPM	1890U
 #define DGX_EC_EXPECTED_FAN1_MAX_RPM	13500U
+/*
+ * EC firmware 0x03000d07 narrows both channels to the same symmetric range.
+ * Accept both observed contracts; anything else still fails the probe.
+ */
+#define DGX_EC_03000D07_FAN0_MIN_RPM	975U
+#define DGX_EC_03000D07_FAN0_MAX_RPM	4350U
+#define DGX_EC_03000D07_FAN1_MIN_RPM	975U
+#define DGX_EC_03000D07_FAN1_MAX_RPM	4350U
 #define DGX_EC_LIMIT_UNSET		U16_MAX
 #define DGX_EC_LIMIT_STOPPED		0U
 #define DGX_EC_MAX_PLAUSIBLE_RPM	30000U
@@ -107,6 +115,58 @@ struct dgx_ec_fan_capabilities {
 	__le16 fan1_min;
 	__le16 fan1_max;
 } __packed;
+
+struct dgx_ec_capability_profile {
+	const char *firmware;
+	u16 fan0_min;
+	u16 fan0_max;
+	u16 fan1_min;
+	u16 fan1_max;
+};
+
+static const struct dgx_ec_capability_profile dgx_ec_capability_profiles[] = {
+	{
+		.firmware = "original",
+		.fan0_min = DGX_EC_EXPECTED_FAN0_MIN_RPM,
+		.fan0_max = DGX_EC_EXPECTED_FAN0_MAX_RPM,
+		.fan1_min = DGX_EC_EXPECTED_FAN1_MIN_RPM,
+		.fan1_max = DGX_EC_EXPECTED_FAN1_MAX_RPM,
+	},
+	{
+		.firmware = "0x03000d07",
+		.fan0_min = DGX_EC_03000D07_FAN0_MIN_RPM,
+		.fan0_max = DGX_EC_03000D07_FAN0_MAX_RPM,
+		.fan1_min = DGX_EC_03000D07_FAN1_MIN_RPM,
+		.fan1_max = DGX_EC_03000D07_FAN1_MAX_RPM,
+	},
+};
+
+static int dgx_ec_match_capabilities(
+	const struct dgx_ec_fan_capabilities *capabilities,
+	const char **firmware)
+{
+	unsigned int i;
+
+	if (capabilities->revision != DGX_EC_CAPABILITIES_REVISION ||
+	    capabilities->unit_mode != 0)
+		return -EBADMSG;
+
+	for (i = 0; i < ARRAY_SIZE(dgx_ec_capability_profiles); i++) {
+		const struct dgx_ec_capability_profile *profile =
+			&dgx_ec_capability_profiles[i];
+
+		if (le16_to_cpu(capabilities->fan0_min) != profile->fan0_min ||
+		    le16_to_cpu(capabilities->fan0_max) != profile->fan0_max ||
+		    le16_to_cpu(capabilities->fan1_min) != profile->fan1_min ||
+		    le16_to_cpu(capabilities->fan1_max) != profile->fan1_max)
+			continue;
+		if (firmware)
+			*firmware = profile->firmware;
+		return 0;
+	}
+
+	return -EBADMSG;
+}
 
 /* Fixed-size, in-memory history only. Printed at a paced recovery incident. */
 struct dgx_ec_trace {
@@ -693,6 +753,7 @@ static int dgx_ec_read_lower_floor(struct dgx_ec_fan_control_data *data,
 static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 {
 	struct dgx_ec_fan_capabilities capabilities;
+	const char *firmware = NULL;
 	int ret;
 
 	ret = dgx_ec_read_operation(data,
@@ -701,24 +762,34 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 	if (ret)
 		return ret;
 
-	if (capabilities.revision != DGX_EC_CAPABILITIES_REVISION ||
-	    capabilities.unit_mode != 0 ||
-	    le16_to_cpu(capabilities.fan0_min) !=
-		DGX_EC_EXPECTED_FAN0_MIN_RPM ||
-	    le16_to_cpu(capabilities.fan0_max) !=
-		DGX_EC_EXPECTED_FAN0_MAX_RPM ||
-	    le16_to_cpu(capabilities.fan1_min) !=
-		DGX_EC_EXPECTED_FAN1_MIN_RPM ||
-	    le16_to_cpu(capabilities.fan1_max) !=
-		DGX_EC_EXPECTED_FAN1_MAX_RPM)
-		return -EBADMSG;
+	dev_info(&data->ffa_dev->dev,
+		 "raw caps rev=%u unit=%u f0min=%u f0max=%u "
+		 "f1min=%u f1max=%u\n",
+		 capabilities.revision, capabilities.unit_mode,
+		 le16_to_cpu(capabilities.fan0_min),
+		 le16_to_cpu(capabilities.fan0_max),
+		 le16_to_cpu(capabilities.fan1_min),
+		 le16_to_cpu(capabilities.fan1_max));
+
+	ret = dgx_ec_match_capabilities(&capabilities, &firmware);
+	if (ret) {
+		dev_err(&data->ffa_dev->dev,
+			"unsupported fan capabilities rev=%u unit=%u "
+			"f0min=%u f0max=%u f1min=%u f1max=%u\n",
+			capabilities.revision, capabilities.unit_mode,
+			le16_to_cpu(capabilities.fan0_min),
+			le16_to_cpu(capabilities.fan0_max),
+			le16_to_cpu(capabilities.fan1_min),
+			le16_to_cpu(capabilities.fan1_max));
+		return ret;
+	}
 
 	dev_info(&data->ffa_dev->dev,
-		 "pinned RPM capabilities fan0=%u..%u fan1=%u..%u\n",
-		 DGX_EC_EXPECTED_FAN0_MIN_RPM,
-		 DGX_EC_EXPECTED_FAN0_MAX_RPM,
-		 DGX_EC_EXPECTED_FAN1_MIN_RPM,
-		 DGX_EC_EXPECTED_FAN1_MAX_RPM);
+		 "pinned RPM capabilities fan0=%u..%u fan1=%u..%u (EC %s)\n",
+		 le16_to_cpu(capabilities.fan0_min),
+		 le16_to_cpu(capabilities.fan0_max),
+		 le16_to_cpu(capabilities.fan1_min),
+		 le16_to_cpu(capabilities.fan1_max), firmware);
 	return 0;
 }
 
