@@ -24,8 +24,10 @@ dgx-fan-control status
 ```
 
 State 12 requests the maximum common floor. The two fans can reach approximately
-**9000 and 13500 RPM** respectively. They accelerate under firmware control;
-setting a state does not instantly change their measured speed.
+**9000 and 13500 RPM** respectively. With EC `0x03000d07` both channels are
+limited to **4350 RPM**, so states above the third floor (4500 RPM) all saturate
+at that maximum. They accelerate under firmware control; setting a state does
+not instantly change their measured speed.
 
 ### 2. Let the machine cool, then run your workload
 

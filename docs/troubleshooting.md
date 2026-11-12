@@ -23,6 +23,13 @@ capability response. Read the kernel log; do not remove validation checks.
 This implementation matches the NVIDIA P4242 platform only. Other GB10 boards
 have not been qualified.
 
+A rejected capability response first logs `raw caps rev=... unit=... f0min=...
+f0max=... f1min=... f1max=...`, then `unsupported fan capabilities` with the
+same values and returns `-EBADMSG`. The driver accepts only the original
+1260–9000 / 1890–13500 assignment and the 975–4350 assignment reported by EC
+`0x03000d07`. Report the logged values with your firmware version instead of
+relaxing the range check to a wildcard.
+
 An older experimental driver may already own the relay. Do not load multiple
 fan drivers or run a direct packet client alongside the controller. Restore
 automatic control with the existing owner before replacing it.

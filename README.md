@@ -57,9 +57,12 @@ policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-f
 ## Compatibility
 
 Originally tested on two **NVIDIA DGX Sparks, board P4242**, with DGX OS 7.5.0,
-kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. Other GB10 systems,
+kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. The driver also
+accepts the narrower, symmetric **975–4350 RPM** capability range reported by
+EC firmware **`0x03000d07`**, validated on one P4242 system. On that firmware
+the higher floor states saturate at the lower fan maxima. Other GB10 systems,
 OEM variants, generic kernels, and future firmware are unverified. The driver
-rejects platform or protocol responses outside its observed contract.
+rejects platform or protocol responses outside these observed contracts.
 
 You need Python 3.10+, matching NVIDIA kernel headers and build tools, and an
 enrolled local signing certificate when Secure Boot is enabled. DKMS is optional;
