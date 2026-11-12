@@ -44,6 +44,20 @@ class KernelContractTests(unittest.TestCase):
         ):
             self.assertIn(requirement, SOURCE)
 
+    def test_accepts_both_observed_fan_ranges(self):
+        for requirement in (
+            "DGX_EC_EXPECTED_FAN0_MIN_RPM\t1260U",
+            "DGX_EC_EXPECTED_FAN0_MAX_RPM\t9000U",
+            "DGX_EC_EXPECTED_FAN1_MIN_RPM\t1890U",
+            "DGX_EC_EXPECTED_FAN1_MAX_RPM\t13500U",
+            "DGX_EC_03000D07_FAN0_MIN_RPM\t975U",
+            "DGX_EC_03000D07_FAN0_MAX_RPM\t4350U",
+            "DGX_EC_03000D07_FAN1_MIN_RPM\t975U",
+            "DGX_EC_03000D07_FAN1_MAX_RPM\t4350U",
+            "dgx_ec_match_capabilities",
+        ):
+            self.assertIn(requirement, SOURCE)
+
     def test_orderly_lifecycle_restores_automatic_policy(self):
         self.assertIn("dgx_ec_restore_automatic(data, \"suspend\")", SOURCE)
         self.assertIn("dgx_ec_restore_automatic(data, \"reboot\")", SOURCE)

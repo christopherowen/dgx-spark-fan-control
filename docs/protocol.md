@@ -31,7 +31,7 @@ own services. It does not map the eSPI controller or access EC memory directly.
 | Partition ID / properties | `0x8003` / `0x0109` |
 | Capabilities discriminator | 1 (exact vendor name is unknown) |
 | Unit mode | 0 (RPM) |
-| Fan 0 / fan 1 ranges | 1260–9000 / 1890–13500 RPM |
+| Fan 0 / fan 1 ranges | 1260–9000 / 1890–13500 RPM, or 975–4350 RPM on both channels |
 
 Submit messages start with command byte `0x01`, then operation, input length,
 output length, and any input bytes. Poll uses command byte `0x02`. The secure
@@ -61,13 +61,18 @@ should own this relay. FF-A call duration itself is not bounded by the poll loop
 
 Capabilities contain the discriminator and unit mode, followed by four
 little-endian `u16` values: fan 0 minimum, fan 0 maximum, fan 1 minimum, fan 1
-maximum. In RPM mode, telemetry offsets 4 and 6 contain the two little-endian
-`u16` RPM readings. Other telemetry fields are not exposed. RPM observations
-are cached for one second and values above 30,000 are rejected.
+maximum. The driver accepts two observed RPM assignments: the original
+1260–9000 / 1890–13500 configuration and the symmetric 975–4350 configuration
+reported by EC firmware `0x03000d07`. Any other discriminator, unit mode, or
+range combination still fails the probe. In RPM mode, telemetry offsets 4 and
+6 contain the two little-endian `u16` RPM readings. Other telemetry fields are
+not exposed. RPM observations are cached for one second and values above
+30,000 are rejected.
 
 The observed operation table and lengths agree across official EC firmware
-2.4.11, 3.3.2, and 3.5.8. Live validation covered 3.5.8. Unknown responses fail
-the local operation rather than selecting another transport.
+2.4.11, 3.3.2, and 3.5.8. Live validation covered 3.5.8; EC `0x03000d07` was
+validated on a single P4242 system. Unknown responses fail the local operation
+rather than selecting another transport.
 
 ## Additive control and ownership
 
@@ -92,7 +97,8 @@ non-zero value returns `ESTALE` and is never overwritten. A second writer
 using the same value cannot be distinguished, so exclusive relay ownership
 remains required.
 
-A clamp of 0 is not an owner. The fan minima are 1260 and 1890 RPM, and 0
+A clamp of 0 is not an owner. The fan minima are 1260 and 1890 RPM on the
+original profile, or 975 RPM on both channels with EC `0x03000d07`, and 0
 leaves both fans stopped. The EC retains it across a warm reboot. Probe,
 `automatic`, and every other restoration write the unset value over it, so a
 loaded module whose performance service is not running is NVIDIA's curve.

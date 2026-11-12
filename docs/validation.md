@@ -1,5 +1,28 @@
 # Validation and provenance
 
+## EC 0x03000d07 capability profile
+
+On **2026-11-08** a P4242 system running kernel **`7.0.0-1025-nvidia`** with
+BIOS **`5.36_0ACUM028`** rejected the 0.1.4 probe after EC firmware was updated
+to **`0x03000d07`** (from `0x03000508` / 3.5.8) on 2026-10-30. The kernel log
+reported `raw caps rev=1 unit=0 f0min=975 f0max=4350 f1min=975 f1max=4350`,
+then `error -EBADMSG: refusing fan-floor cooling device`.
+
+A local build that accepts this assignment alongside the original
+1260–9000 / 1890–13500 one logged `pinned RPM capabilities fan0=975..4350
+fan1=975..4350`, registered the additive cooling device, and reported
+`automatic fan policy active for module load` with `baseline fan1=1961
+fan2=1991 RPM`. `dgx-fan-control status` returned `state=0/12 hottest=41.8C`.
+`set-state` and `automatic` were not exercised as root; a later service-start
+failure was a separate polkit authentication issue.
+
+The compiled transaction test covers the two-profile matcher, including
+rejection of an unrecognized range, unit mode, or discriminator. The full probe
+was not re-run on this host after restructuring the acceptance path. The
+9000/13500 RPM floor states remain in the table and saturate at the 4350 RPM
+channel maximum, so higher-state thermal behavior differs from the original
+profile.
+
 ## Version 0.1.4 zero-clamp restore
 
 On **2026-10-29** the signed module was built on **dgx4** with DKMS against

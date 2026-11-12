@@ -39,6 +39,8 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef unsigned long long u64;
+typedef uint16_t __le16;
+#define __packed
 #define U16_MAX UINT16_MAX
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define dev_info(...) ((void)0)
@@ -78,6 +80,7 @@ static int mutex_lock_interruptible(struct mutex *m) { (void)m; return 0; }
 static void mutex_lock(struct mutex *m) { (void)m; }
 static void mutex_unlock(struct mutex *m) { (void)m; }
 static void msleep(unsigned int ms) { jiffies += ms; }
+static u16 le16_to_cpu(u16 value) { return value; }
 static u16 get_unaligned_le16(const void *ptr) {
  const u8 *p = ptr; return p[0] | ((u16)p[1] << 8);
 }
@@ -372,6 +375,25 @@ int main(int argc, char **argv) {
   poll_state_override = -1; transport_error_once = -EAGAIN;
   assert(dgx_ec_set_cur_state(&cdev, 5) == -EAGAIN);
   assert(submit_count == 0 && write_count == 0);
+ } else if (!strcmp(argv[1], "capability_profiles")) {
+  struct dgx_ec_fan_capabilities caps = {.revision = 1, .unit_mode = 0};
+  const char *firmware = NULL;
+  caps.fan0_min = 1260; caps.fan0_max = 9000;
+  caps.fan1_min = 1890; caps.fan1_max = 13500;
+  assert(dgx_ec_match_capabilities(&caps, &firmware) == 0);
+  assert(firmware && !strcmp(firmware, "original"));
+  caps.fan0_min = 975; caps.fan0_max = 4350;
+  caps.fan1_min = 975; caps.fan1_max = 4350;
+  firmware = NULL;
+  assert(dgx_ec_match_capabilities(&caps, &firmware) == 0);
+  assert(firmware && !strcmp(firmware, "0x03000d07"));
+  caps.fan1_max = 4351;
+  firmware = NULL;
+  assert(dgx_ec_match_capabilities(&caps, &firmware) == -EBADMSG && !firmware);
+  caps.fan1_max = 4350; caps.unit_mode = 1;
+  assert(dgx_ec_match_capabilities(&caps, NULL) == -EBADMSG);
+  caps.unit_mode = 0; caps.revision = 2;
+  assert(dgx_ec_match_capabilities(&caps, NULL) == -EBADMSG);
  } else { assert(!"unknown case"); }
  return 0;
 }
@@ -386,6 +408,13 @@ class KernelTransactionTests(unittest.TestCase):
         root = Path(cls.temp.name)
         defines = "\n".join(re.findall(r"^#define DGX_EC_.*$", SOURCE, re.M))
         table = re.search(r"static const u16 dgx_ec_floor_states\[\] = \{.*?\n\};", SOURCE, re.S)[0]
+        capabilities = re.search(
+            r"struct dgx_ec_fan_capabilities \{.*?\n\} __packed;", SOURCE, re.S)[0]
+        profile = re.search(
+            r"struct dgx_ec_capability_profile \{.*?\n\};", SOURCE, re.S)[0]
+        profiles = re.search(
+            r"static const struct dgx_ec_capability_profile "
+            r"dgx_ec_capability_profiles\[\] = \{.*?\n\};", SOURCE, re.S)[0]
         data = re.search(r"struct dgx_ec_fan_control_data \{.*?\n\};", SOURCE, re.S)[0]
         trace = re.search(r"struct dgx_ec_trace \{.*?\n\};", SOURCE, re.S)[0]
         names = (
@@ -394,12 +423,13 @@ class KernelTransactionTests(unittest.TestCase):
             "dgx_ec_reconcile_floor", "dgx_ec_read_fixed", "dgx_ec_valid_rtc",
             "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_recover_pending",
             "dgx_ec_preflight", "dgx_ec_read_operation", "dgx_ec_write_lower_floor",
-            "dgx_ec_read_lower_floor",
+            "dgx_ec_read_lower_floor", "dgx_ec_match_capabilities",
             "dgx_ec_restore_automatic_locked", "dgx_ec_restore_automatic",
             "dgx_ec_get_cur_state", "dgx_ec_set_cur_state",
         )
         source = root / "transactions.c"
-        source.write_text(SHIM + defines + "\n" + table + "\n" + trace + "\n" + data + "\n" +
+        source.write_text(SHIM + defines + "\n" + table + "\n" + capabilities + "\n" +
+                          profile + "\n" + profiles + "\n" + trace + "\n" + data + "\n" +
                           "\n".join(c_function(name) for name in names) + MAIN)
         cls.binary = root / "transactions"
         subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
@@ -412,6 +442,7 @@ class KernelTransactionTests(unittest.TestCase):
             "zero_clamp",
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
+            "capability_profiles",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):
